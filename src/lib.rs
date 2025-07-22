@@ -234,7 +234,7 @@ impl Header {
                 return Err(Error::Data);
             }
             let hex = &mut hexbuf[..len];
-            hex::encode_to_slice(&out, hex).map_err(|_| Error::Data)?;
+            hex::encode_to_slice(out, hex).map_err(|_| Error::Data)?;
             out.truncate(0);
             out.extend_from_slice(hex);
         }
