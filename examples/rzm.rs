@@ -4,6 +4,7 @@ extern crate zmodem2;
 mod stdinout;
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -12,9 +13,9 @@ use std::path::Path;
 #[command(author, version, about, long_about = None)]
 #[command(about = "Receive a ZMODEM file transfer", long_about = None)]
 pub struct Arguments {
-    /// Filename
+    /// File path
     #[arg(short, long, default_value_t = String::default())]
-    pub file_name: String,
+    pub path: String,
 }
 
 fn main() {
@@ -31,28 +32,34 @@ fn main() {
             }
         }
     }
-    let file_name = if args.file_name.is_empty() {
+    let path = if args.path.is_empty() {
         Path::new(state.file_name()).file_name().unwrap()
     } else {
-        Path::new(&args.file_name).file_name().unwrap()
+        Path::new(&args.path).file_name().unwrap()
     };
-    eprintln!(
-        "RX {} {} bytes",
-        file_name.to_str().unwrap(),
-        state.file_size()
+    let pb = ProgressBar::new(state.file_size() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{msg}\n{spinner} [{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
     );
-    let mut file = File::create(file_name).unwrap();
+    pb.set_message(format!("Receiving {}", path.to_str().unwrap()));
+    let mut file = File::create(path).unwrap();
     file.write_all(&buf).unwrap();
     while state.stage() != zmodem2::Stage::Done {
         match zmodem2::receive(&mut port, &mut file, &mut state) {
             Ok(()) => {
-                eprintln!("RX {} / {}", state.count(), state.file_size());
+                pb.set_position(state.count() as u64);
                 continue;
             }
             _ => {
-                eprintln!("RX error");
+                pb.finish_with_message("RX error");
                 return;
             }
         }
     }
+    pb.finish_with_message("Done");
 }

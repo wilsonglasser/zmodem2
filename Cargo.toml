@@ -24,6 +24,7 @@ tinyvec = "1.6.0"
 [dev-dependencies]
 clap = { version = "4.4", features = ["derive"] }
 rstest = "0.25"
+indicatif = "0.17"
 
 [[example]]
 name = "rzm"
