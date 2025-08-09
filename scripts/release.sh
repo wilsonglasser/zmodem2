@@ -11,7 +11,7 @@ fi
 MESSAGE=$(
   echo "Release $NEXT"
   echo ""
-  git log --pretty=format:"- %s" --no-merges "$PREVIOUS..HEAD"
+  git log --pretty=format:"- %s (%an)" --no-merges "$PREVIOUS..HEAD"
 )
 
 printf "%s" "$MESSAGE" | git tag -s "$NEXT" -F -
