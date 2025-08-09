@@ -1,8 +1,6 @@
 extern crate zmodem2;
 
-use std::fs::{remove_file, File};
 use std::io::*;
-use std::process::*;
 
 struct InOut<R: Read, W: Write> {
     r: R,

@@ -454,7 +454,7 @@ impl State {
     /// * `Err(Error::Write)` when the write I/O fails with the serial port
     /// * `Err(Error::Data)` when corrupted data has been detected
     pub fn new_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
-        let file_name = String::from_str(file_name).or(Err(Error::Data))?;
+        let file_name = String::from_str(file_name).map_err(|()| Error::Data)?;
         Ok(Self {
             stage: Stage::Waiting,
             count: 0,
@@ -519,31 +519,29 @@ where
         Ok(frame) => frame,
     };
     match frame.frame() {
-        Frame::ZRINIT => match state.stage {
-            Stage::Waiting => {
+        Frame::ZRINIT => {
+            if state.stage == Stage::Waiting {
                 write_zfile(port, &mut state.buf, &state.file_name, state.file_size)?;
                 state.stage = Stage::Ready;
+            } else if state.stage == Stage::InProgress {
+                ZFIN_HEADER.write(port)?;
             }
-            Stage::InProgress => ZFIN_HEADER.write(port)?,
-            Stage::Ready | Stage::Done => (),
-        },
-        Frame::ZRPOS | Frame::ZACK => match state.stage {
-            Stage::Waiting => ZRQINIT_HEADER.write(port)?,
-            Stage::Ready | Stage::InProgress => {
+        }
+        Frame::ZRPOS | Frame::ZACK => {
+            if state.stage == Stage::Waiting {
+                ZRQINIT_HEADER.write(port)?;
+            } else if state.stage == Stage::Ready || state.stage == Stage::InProgress {
                 write_zdata(port, &mut state.buf, file, frame.count())?;
                 state.stage = Stage::InProgress;
             }
-            Stage::Done => (),
-        },
-        Frame::ZFIN => match state.stage {
-            Stage::Waiting => ZRQINIT_HEADER.write(port)?,
-            Stage::InProgress => {
+        }
+        Frame::ZFIN => {
+            if state.stage == Stage::InProgress {
                 port.write_byte(b'O')?;
                 port.write_byte(b'O')?;
                 state.stage = Stage::Done;
             }
-            Stage::Ready | Stage::Done => (),
-        },
+        }
         _ => {
             if state.stage == Stage::Waiting {
                 ZRQINIT_HEADER.write(port)?;
@@ -579,16 +577,16 @@ where
         Ok(header) => header,
     };
     match header.frame() {
-        Frame::ZFILE => match state.stage {
-            Stage::Waiting | Stage::Ready => {
+        Frame::ZFILE => {
+            if state.stage == Stage::Waiting || state.stage == Stage::Ready {
                 read_zfile(port, state, header.encoding())?;
                 state.stage = Stage::Ready;
             }
-            Stage::InProgress | Stage::Done => (),
-        },
-        Frame::ZDATA => match state.stage {
-            Stage::Waiting => write_zrinit(port)?,
-            Stage::Ready | Stage::InProgress => {
+        }
+        Frame::ZDATA => {
+            if state.stage == Stage::Waiting {
+                write_zrinit(port)?;
+            } else if state.stage == Stage::Ready || state.stage == Stage::InProgress {
                 if header.count() != state.count {
                     ZRPOS_HEADER.with_count(state.count).write(port)?;
                     return Ok(());
@@ -596,23 +594,18 @@ where
                 read_zdata(port, state, header.encoding(), file)?;
                 state.stage = Stage::InProgress;
             }
-            Stage::Done => (),
-        },
-        Frame::ZEOF => match state.stage {
-            Stage::InProgress => {
-                if header.count() == state.count {
-                    write_zrinit(port)?;
-                }
+        }
+        Frame::ZEOF => {
+            if state.stage == Stage::InProgress && header.count() == state.count {
+                write_zrinit(port)?;
             }
-            Stage::Waiting | Stage::Ready | Stage::Done => (),
-        },
-        Frame::ZFIN => match state.stage {
-            Stage::InProgress => {
+        }
+        Frame::ZFIN => {
+            if state.stage == Stage::InProgress {
                 ZFIN_HEADER.write(port)?;
                 state.stage = Stage::Done;
             }
-            Stage::Waiting | Stage::Ready | Stage::Done => (),
-        },
+        }
         _ => (),
     }
     Ok(())
@@ -632,7 +625,7 @@ fn write_zfile<P>(port: &mut P, buf: &mut Buffer, name: &str, size: u32) -> Resu
 where
     P: Write,
 {
-    let size = String::<17>::try_from(size).or(Err(Error::Data))?;
+    let size = String::<17>::from_str(&size.to_string()).map_err(|()| Error::Data)?;
     buf.clear();
     buf.extend_from_slice(name.as_bytes());
     buf.push(b'\0');
@@ -650,20 +643,20 @@ where
 {
     match read_subpacket(port, &mut state.buf, encoding) {
         Ok(_) => {
-            let payload = core::str::from_utf8(state.buf.as_slice()).or(Err(Error::Data))?;
-            for (i, field) in payload.split('\0').enumerate() {
-                if i == 0 {
-                    state.file_name = String::from_str(field).or(Err(Error::Data))?;
-                }
-                if i == 1 {
-                    if let Some(field) = field.split_ascii_whitespace().next() {
-                        state.file_size = u32::from_str(field).or(Err(Error::Data))?;
-                    }
+            let payload = core::str::from_utf8(state.buf.as_slice()).map_err(|_| Error::Data)?;
+            let mut fields = payload.split('\0');
+            state.file_name =
+                String::from_str(fields.next().unwrap_or("")).map_err(|()| Error::Data)?;
+
+            if let Some(size_str) = fields.next() {
+                if let Some(field) = size_str.split_ascii_whitespace().next() {
+                    state.file_size = u32::from_str(field).map_err(|_| Error::Data)?;
                 }
             }
+
             ZRPOS_HEADER.with_count(0).write(port)
         }
-        _ => ZNAK_HEADER.write(port).or(Err(Error::Data)),
+        _ => ZNAK_HEADER.write(port).map_err(|_| Error::Data),
     }
 }
 
