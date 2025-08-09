@@ -1,3 +1,4 @@
 target/
 LICENSE-APACHE
 LICENSE-MIT
+tests/test.bin
