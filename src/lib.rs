@@ -42,7 +42,7 @@ const CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_XMODEM);
 /// CRC algorithm for `ZBIN32` encoded transmissions.
 const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
-/// <https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=20db24d9f0aaff4d13f0144416f34d46>
+/// ZMODEM escape table, a constant array for escaping characters.
 const ZDLE_TABLE: [u8; 0x100] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x4d, 0x0e, 0x0f,
     0x50, 0x51, 0x12, 0x53, 0x14, 0x15, 0x16, 0x17, 0x58, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -62,7 +62,7 @@ const ZDLE_TABLE: [u8; 0x100] = [
     0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0x6d,
 ];
 
-/// <https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=20db24d9f0aaff4d13f0144416f34d46>
+/// ZMODEM unescape table, a constant array for converting escaped characters back.
 const UNZDLE_TABLE: [u8; 0x100] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -746,6 +746,11 @@ where
 }
 
 /// Skips (ZPAD, [ZPAD,] ZDLE) sequence.
+///
+/// # Errors
+///
+/// Returns `Error::Data` if the sequence is malformed or `Error::Read` on an
+/// I/O error.
 fn read_zpad<P>(port: &mut P) -> Result<(), Error>
 where
     P: Read,
@@ -766,7 +771,16 @@ where
     Err(Error::Data)
 }
 
-/// Reads and unescapes a ZMODEM protocol subpacket
+/// Reads and unescapes a ZMODEM protocol subpacket.
+///
+/// # Errors
+///
+/// Returns `Error::Data` if the subpacket fails CRC validation or is malformed.
+///
+/// # Panics
+///
+/// The function will panic if the buffer is somehow empty when attempting to
+/// pop the CRC byte, which should not happen in a valid transmission.
 fn read_subpacket<P>(port: &mut P, buf: &mut Buffer, encoding: Encoding) -> Result<Packet, Error>
 where
     P: Read,
@@ -827,6 +841,12 @@ where
     Ok(result)
 }
 
+/// Writes a subpacket.
+///
+/// # Errors
+///
+/// This function returns `Error::Write` on an I/O error or `Error::Data` on
+/// a data validation error.
 fn write_subpacket<P>(
     port: &mut P,
     encoding: Encoding,
