@@ -21,6 +21,7 @@
 
 mod buffer;
 mod crc;
+mod hex;
 #[cfg(feature = "std")]
 mod std;
 mod zdle;
@@ -66,6 +67,8 @@ pub enum Error {
     FileNameMissing,
     /// Filename in the ZFILE packet has zero length
     FileNameEmpty,
+    /// Invalid hex string
+    InvalidHex,
     /// I/O error during read
     Read,
     /// I/O error during write
@@ -193,15 +196,15 @@ impl Header {
         out.extend_from_slice(&crc[..crc_len])?;
         // Skips ZPAD and encoding:
         if self.encoding == Encoding::ZHEX {
-            let mut hexbuf = [0u8; HEADER_SIZE];
+            let mut hex_buf = [0u8; HEADER_SIZE];
             let len = out.len() * 2;
-            if len > hexbuf.len() {
+            if len > hex_buf.len() {
                 return Err(Error::Data);
             }
-            let hex_slice = &mut hexbuf[..len];
-            hex::encode_to_slice(&out, hex_slice).map_err(|_| Error::Data)?;
+            let hex = &mut hex_buf[..len];
+            hex::encode(&out, hex)?;
             out.clear();
-            out.extend_from_slice(hex_slice)?;
+            out.extend_from_slice(hex)?;
         }
         write_slice_escaped(port, &out)?;
         if self.encoding == Encoding::ZHEX {
@@ -234,11 +237,10 @@ impl Header {
         }
         let mut out: Buffer<HEADER_SIZE> = Buffer::new();
         if encoding == Encoding::ZHEX {
-            let mut decoded_bytes = [0u8; HEADER_SIZE / 2];
-            let decoded_len = out_hex.len() / 2;
-            hex::decode_to_slice(&out_hex, &mut decoded_bytes[..decoded_len])
-                .map_err(|_| Error::Data)?;
-            out.extend_from_slice(&decoded_bytes[..decoded_len])?;
+            let mut out_bytes = [0u8; HEADER_SIZE / 2];
+            let out_len = out_hex.len() / 2;
+            hex::decode(&out_hex, &mut out_bytes[..out_len])?;
+            out.extend_from_slice(&out_bytes[..out_len])?;
         } else {
             out.extend_from_slice(&out_hex)?;
         }

@@ -78,6 +78,7 @@ impl fmt::Display for Error {
             Error::Data => write!(f, "data corruption"),
             Error::FileNameMissing => write!(f, "filename missing from ZFILE"),
             Error::FileNameEmpty => write!(f, "filename empty in ZFILE"),
+            Error::InvalidHex => write!(f, "invalid hex string"),
             Error::Read => write!(f, "A read I/O error occurred"),
             Error::Write => write!(f, "A write I/O error occurred"),
         }
