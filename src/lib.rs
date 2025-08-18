@@ -454,7 +454,7 @@ impl State {
     /// * `Err(Error::Write)` when the write I/O fails with the serial port
     /// * `Err(Error::Data)` when corrupted data has been detected
     pub fn new_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
-        let file_name = String::from_str(file_name).map_err(|()| Error::Data)?;
+        let file_name = String::from_str(file_name).or(Err(Error::Data))?;
         Ok(Self {
             stage: Stage::Waiting,
             count: 0,
@@ -616,7 +616,7 @@ fn write_zfile<P>(port: &mut P, buf: &mut Buffer, name: &str, size: u32) -> Resu
 where
     P: Write,
 {
-    let size = String::<17>::from_str(&size.to_string()).map_err(|()| Error::Data)?;
+    let size = String::<17>::try_from(size).or(Err(Error::Data))?;
     buf.clear();
     buf.extend_from_slice(name.as_bytes());
     buf.push(b'\0');
