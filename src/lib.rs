@@ -82,9 +82,9 @@ const UNZDLE_TABLE: [u8; 0x100] = [
     0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
 ];
 
-const ZPAD: u8 = b'*';
-const ZDLE: u8 = 0x18;
-const XON: u8 = 0x11;
+pub const ZPAD: u8 = b'*';
+pub const ZDLE: u8 = 0x18;
+pub const XON: u8 = 0x11;
 const ZACK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZACK, &[0; 4]);
 const ZDATA_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZDATA, &[0; 4]);
 const ZEOF_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZEOF, &[0; 4]);
@@ -94,7 +94,7 @@ const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, &[0; 4]);
 const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 4]);
 
 /// Staging and temporal storage for incoming and outgoing frames
-type Buffer = ArrayVec<[u8; BUFFER_SIZE]>;
+pub type Buffer = ArrayVec<[u8; BUFFER_SIZE]>;
 
 /// Error codes for `zmodem2::send` and `zmodem2::receive`
 #[derive(Debug, PartialEq)]
@@ -511,12 +511,9 @@ where
     if read_zpad(port).is_err() {
         return Ok(());
     }
-    let frame = match Header::read(port) {
-        Err(_) => {
-            ZNAK_HEADER.write(port)?;
-            return Ok(());
-        }
-        Ok(frame) => frame,
+    let Ok(frame) = Header::read(port) else {
+        ZNAK_HEADER.write(port)?;
+        return Ok(());
     };
     match frame.frame() {
         Frame::ZRINIT => {
@@ -569,12 +566,9 @@ where
     if read_zpad(port).is_err() {
         return Ok(());
     }
-    let header = match Header::read(port) {
-        Err(_) => {
-            ZNAK_HEADER.write(port)?;
-            return Ok(());
-        }
-        Ok(header) => header,
+    let Ok(header) = Header::read(port) else {
+        ZNAK_HEADER.write(port)?;
+        return Ok(());
     };
     match header.frame() {
         Frame::ZFILE => {
@@ -744,7 +738,7 @@ where
 ///
 /// Returns `Error::Data` if the sequence is malformed or `Error::Read` on an
 /// I/O error.
-fn read_zpad<P>(port: &mut P) -> Result<(), Error>
+pub fn read_zpad<P>(port: &mut P) -> Result<(), Error>
 where
     P: Read,
 {
@@ -774,7 +768,11 @@ where
 ///
 /// The function will panic if the buffer is somehow empty when attempting to
 /// pop the CRC byte, which should not happen in a valid transmission.
-fn read_subpacket<P>(port: &mut P, buf: &mut Buffer, encoding: Encoding) -> Result<Packet, Error>
+pub fn read_subpacket<P>(
+    port: &mut P,
+    buf: &mut Buffer,
+    encoding: Encoding,
+) -> Result<Packet, Error>
 where
     P: Read,
 {
@@ -840,7 +838,7 @@ where
 ///
 /// This function returns `Error::Write` on an I/O error or `Error::Data` on
 /// a data validation error.
-fn write_subpacket<P>(
+pub fn write_subpacket<P>(
     port: &mut P,
     encoding: Encoding,
     kind: Packet,
@@ -927,74 +925,4 @@ where
     } else {
         b
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        read_subpacket, read_zpad, write_subpacket, Buffer, Encoding, Error, Frame, Header, Packet,
-        XON, ZDLE, ZPAD,
-    };
-
-    #[rstest::rstest]
-    #[case(Encoding::ZBIN, Frame::ZRQINIT, &[0; 4], &[ZPAD, ZDLE, Encoding::ZBIN as u8, 0, 0, 0, 0, 0, 0, 0])]
-    #[case(Encoding::ZBIN32, Frame::ZRQINIT, &[0; 4], &[ZPAD, ZDLE, Encoding::ZBIN32 as u8, 0, 0, 0, 0, 0, 29, 247, 34, 198])]
-    #[case(Encoding::ZBIN, Frame::ZRQINIT, &[1; 4], &[ZPAD, ZDLE, Encoding::ZBIN as u8, 0, 1, 1, 1, 1, 98, 148])]
-    #[case(Encoding::ZHEX, Frame::ZRQINIT, &[1; 4], &[ZPAD, ZPAD, ZDLE, Encoding::ZHEX as u8, b'0', b'0', b'0', b'1', b'0', b'1', b'0', b'1', b'0', b'1', 54, 50, 57, 52, b'\r', b'\n', XON])]
-    pub fn test_header_write(
-        #[case] encoding: Encoding,
-        #[case] frame: Frame,
-        #[case] flags: &[u8; 4],
-        #[case] expected: &[u8],
-    ) {
-        let header = Header::new(encoding, frame, flags);
-        let mut port = vec![];
-        assert!(header.write(&mut port) == Ok(()));
-        assert_eq!(port, expected);
-    }
-
-    #[rstest::rstest]
-    #[case(&[Encoding::ZHEX as u8, b'0', b'1', b'0', b'1', b'0', b'2', b'0', b'3', b'0', b'4', b'a', b'7', b'5', b'2'], Encoding::ZHEX, Frame::ZRINIT, &[0x1, 0x2, 0x3, 0x4])]
-    #[case(&[Encoding::ZBIN as u8, Frame::ZRINIT as u8, 0xa, 0xb, 0xc, 0xd, 0xa6, 0xcb], Encoding::ZBIN, Frame::ZRINIT, &[0xa, 0xb, 0xc, 0xd])]
-    #[case(&[Encoding::ZBIN32 as u8, Frame::ZRINIT as u8, 0xa, 0xb, 0xc, 0xd, 0x99, 0xe2, 0xae, 0x4a], Encoding::ZBIN32, Frame::ZRINIT, &[0xa, 0xb, 0xc, 0xd])]
-    #[case(&[Encoding::ZBIN as u8, Frame::ZRINIT as u8, 0xa, ZDLE, b'l', 0xd, ZDLE, b'm', 0x5e, 0x6f], Encoding::ZBIN, Frame::ZRINIT, &[0xa, 0x7f, 0xd, 0xff])]
-    pub fn test_header_read(
-        #[case] port: &[u8],
-        #[case] encoding: Encoding,
-        #[case] frame: Frame,
-        #[case] flags: &[u8; 4],
-    ) {
-        let port = &mut port.to_vec();
-        let port = &mut port.as_slice();
-        assert!(Header::read(port) == Ok(Header::new(encoding, frame, flags)));
-    }
-
-    #[rstest::rstest]
-    #[case(Encoding::ZBIN, Packet::ZCRCE, &[])]
-    #[case(Encoding::ZBIN, Packet::ZCRCW, &[0x00])]
-    #[case(Encoding::ZBIN32, Packet::ZCRCQ, &[0, 1, 2, 3, 4, 0x60, 0x60])]
-    pub fn test_subpacket_read_write(
-        #[case] encoding: Encoding,
-        #[case] packet: Packet,
-        #[case] data: &[u8],
-    ) {
-        let mut buf = Buffer::new();
-        let mut port = vec![];
-        assert!(write_subpacket(&mut port, encoding, packet, data) == Ok(()));
-        buf.clear();
-        assert!(read_subpacket(&mut port.as_slice(), &mut buf, encoding) == Ok(packet));
-        assert!(buf == data);
-    }
-
-    #[rstest::rstest]
-    #[case(&[ZPAD, ZDLE], Ok(()))]
-    #[case(&[ZPAD, ZPAD, ZDLE], Ok(()))]
-    #[case(&[ZDLE], Err(Error::Data))]
-    #[case(&[ZPAD, XON], Err(Error::Data))]
-    #[case(&[ZPAD, ZPAD, XON], Err(Error::Data))]
-    #[case(&[], Err(Error::Read))]
-    #[case(&[0; 100], Err(Error::Data))]
-    pub fn test_zpad_read(#[case] port: &[u8], #[case] expected: Result<(), Error>) {
-        assert!(read_zpad(&mut port.to_vec().as_slice()) == expected);
-    }
 }
