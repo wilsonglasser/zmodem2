@@ -181,7 +181,7 @@ impl Header {
     /// * `Err(Error::Data)` when corrupted data has been detected
     pub fn write<P>(&self, port: &mut P) -> Result<(), Error>
     where
-        P: Write,
+        P: Write + ?Sized,
     {
         let mut out = array_vec!([u8; HEADER_SIZE]);
         port.write_byte(ZPAD)?;
@@ -230,7 +230,7 @@ impl Header {
     /// * `Err(Error::Data)` when corrupted data has been detected
     pub fn read<P>(port: &mut P) -> Result<Header, Error>
     where
-        P: Read,
+        P: Read + ?Sized,
     {
         let encoding = Encoding::try_from(port.read_byte()?)?;
         let mut out_hex = array_vec!([u8; HEADER_SIZE]);
@@ -346,8 +346,8 @@ impl TryFrom<u8> for Frame {
 }
 
 bitflags! {
-   /// `ZRINIT` flags
-   struct Zrinit: u8 {
+    /// `ZRINIT` flags
+    struct Zrinit: u8 {
         /// Can send and receive in full-duplex
         const CANFDX = 0x01;
         /// Can receive data in parallel with disk I/O
@@ -472,8 +472,8 @@ pub enum Stage {
 /// * `Err(Error::Data)` when corrupted data has been detected
 pub fn send<P, F>(port: &mut P, file: &mut F, state: &mut State) -> Result<(), Error>
 where
-    P: Read + Write,
-    F: Read + Seek,
+    P: Read + Write + ?Sized,
+    F: Read + Seek + ?Sized,
 {
     if state.stage == Stage::Waiting {
         ZRQINIT_HEADER.write(port)?;
@@ -527,8 +527,8 @@ where
 /// * `Err(Error::Data)` when corrupted data has been detected
 pub fn receive<P, F>(port: &mut P, file: &mut F, state: &mut State) -> Result<(), Error>
 where
-    P: Read + Write,
-    F: Write,
+    P: Read + Write + ?Sized,
+    F: Write + ?Sized,
 {
     if state.stage == Stage::Waiting {
         write_zrinit(port)?;
@@ -578,7 +578,7 @@ where
 /// Writes ZRINIT
 fn write_zrinit<P>(port: &mut P) -> Result<(), Error>
 where
-    P: Write,
+    P: Write + ?Sized,
 {
     let zrinit = Zrinit::CANFDX | Zrinit::CANOVIO | Zrinit::CANFC32;
     Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0, 0, 0, zrinit.bits()]).write(port)
@@ -587,7 +587,7 @@ where
 /// Write ZRFILE
 fn write_zfile<P>(port: &mut P, buf: &mut Buffer, name: &str, size: u32) -> Result<(), Error>
 where
-    P: Write,
+    P: Write + ?Sized,
 {
     let size = String::<17>::try_from(size).or(Err(Error::Data))?;
     buf.clear();
@@ -603,7 +603,7 @@ where
 /// header.
 fn read_zfile<P>(port: &mut P, state: &mut State, encoding: Encoding) -> Result<(), Error>
 where
-    P: Read + Write,
+    P: Read + Write + ?Sized,
 {
     match read_subpacket(port, &mut state.buf, encoding) {
         Ok(_) => {
@@ -631,8 +631,8 @@ where
 /// Writes ZDATA
 fn write_zdata<P, F>(port: &mut P, buf: &mut Buffer, file: &mut F, offset: u32) -> Result<(), Error>
 where
-    P: Read + Write,
-    F: Read + Seek,
+    P: Read + Write + ?Sized,
+    F: Read + Seek + ?Sized,
 {
     let mut offset = offset;
     buf.set_len(BUFFER_SIZE - 2);
@@ -673,8 +673,8 @@ fn read_zdata<P, F>(
     file: &mut F,
 ) -> Result<(), Error>
 where
-    P: Read + Write,
-    F: Write,
+    P: Read + Write + ?Sized,
+    F: Write + ?Sized,
 {
     loop {
         let zcrc = match read_subpacket(port, &mut state.buf, encoding) {
@@ -714,7 +714,7 @@ where
 /// I/O error.
 pub fn read_zpad<P>(port: &mut P) -> Result<(), Error>
 where
-    P: Read,
+    P: Read + ?Sized,
 {
     if port.read_byte()? != ZPAD {
         return Err(Error::Data);
@@ -748,7 +748,7 @@ pub fn read_subpacket<P>(
     encoding: Encoding,
 ) -> Result<Packet, Error>
 where
-    P: Read,
+    P: Read + ?Sized,
 {
     buf.clear();
     let result = loop {
@@ -786,7 +786,7 @@ where
 /// Skips the tail of the subpacket (including CRC).
 fn skip_subpacket_tail<P>(port: &mut P, encoding: Encoding) -> Result<Packet, Error>
 where
-    P: Read,
+    P: Read + ?Sized,
 {
     let result;
     loop {
@@ -819,7 +819,7 @@ pub fn write_subpacket<P>(
     data: &[u8],
 ) -> Result<(), Error>
 where
-    P: Write,
+    P: Write + ?Sized,
 {
     let kind = kind as u8;
     write_slice_escaped(port, data)?;
@@ -869,7 +869,7 @@ fn make_crc(data: &[u8], out: &mut [u8], encoding: Encoding) -> usize {
 #[allow(dead_code)]
 fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<(), Error>
 where
-    P: Write,
+    P: Write + ?Sized,
 {
     for value in buf {
         write_byte_escaped(port, *value)?;
@@ -880,7 +880,7 @@ where
 
 fn write_byte_escaped<P>(port: &mut P, value: u8) -> Result<(), Error>
 where
-    P: Write,
+    P: Write + ?Sized,
 {
     let escaped = zdle::ZDLE_TABLE[value as usize];
     if escaped != value {
@@ -891,7 +891,7 @@ where
 
 fn read_byte_unescaped<P>(port: &mut P) -> Result<u8, Error>
 where
-    P: Read,
+    P: Read + ?Sized,
 {
     let b = port.read_byte()?;
     Ok(if b == ZDLE {
