@@ -44,12 +44,12 @@ const TMP_DIR: &str = env!("CARGO_TARGET_TMPDIR");
 #[cfg(host_has_rzsz)]
 fn test_from_sz() {
     let file_name = format!("{TMP_DIR}/from_sz.bin");
-    let mut file = File::create(&file_name).unwrap();
+    let mut file = std::fs::File::create(&file_name).unwrap();
     file.write_all(TEST_DATA).unwrap();
-    let sz = Command::new("sz")
+    let sz = std::process::Command::new("sz")
         .arg(&file_name)
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let stdin = sz.stdin.unwrap();
@@ -67,10 +67,10 @@ fn test_from_sz() {
 #[cfg(host_has_rzsz)]
 fn test_to_rz() {
     let file_name = format!("{TMP_DIR}/to_rz.bin");
-    remove_file(&file_name).unwrap_or_default();
-    let sz = Command::new("rz")
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
+    std::fs::remove_file(&file_name).unwrap_or_default();
+    let sz = std::process::Command::new("rz")
+        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let stdin = sz.stdin.unwrap();
@@ -82,7 +82,7 @@ fn test_to_rz() {
     while state.stage() != zmodem2::Stage::Done {
         assert!(zmodem2::send(&mut port, &mut file, &mut state) == Ok(()));
     }
-    let mut f = File::open(&file_name).unwrap();
+    let mut f = std::fs::File::open(&file_name).unwrap();
     let mut received = Vec::new();
     f.read_to_end(&mut received).unwrap();
     assert!(TEST_DATA == received);
