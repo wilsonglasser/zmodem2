@@ -51,8 +51,8 @@ fn main() -> anyhow::Result<()> {
             .progress_chars("=>-"),
     );
     pb.set_message(format!("Receiving {}", path.display()));
-    let mut file = File::create(&path)
-        .with_context(|| format!("unable to create '{}'", path.display()))?;
+    let mut file =
+        File::create(&path).with_context(|| format!("unable to create '{}'", path.display()))?;
     file.write_all(&buf)?;
     while state.stage() != zmodem2::Stage::Done {
         if let Err(e) = zmodem2::receive(&mut port, &mut file, &mut state) {

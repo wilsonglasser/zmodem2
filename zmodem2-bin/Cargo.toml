@@ -26,6 +26,3 @@ path = "src/bin/szm.rs"
 name = "integration"
 path = "tests/integration.rs"
 harness = true
-
-[features]
-integration_test = []

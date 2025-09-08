@@ -21,8 +21,8 @@ pub struct Arguments {
 
 fn main() -> anyhow::Result<()> {
     let args: Arguments = argh::from_env();
-    let mut file = File::open(&args.path)
-        .with_context(|| format!("unable to open '{}'", args.path))?;
+    let mut file =
+        File::open(&args.path).with_context(|| format!("unable to open '{}'", args.path))?;
     let filename_path = Path::new(&args.path);
     let filename = filename_path
         .file_name()

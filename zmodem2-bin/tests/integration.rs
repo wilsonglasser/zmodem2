@@ -41,7 +41,7 @@ const TEST_DATA: &[u8] = include_bytes!("test.bin");
 const TMP_DIR: &str = env!("CARGO_TARGET_TMPDIR");
 
 #[test]
-#[cfg(all(host_has_rzsz, feature = "integration_test"))]
+#[cfg(all(host_has_rzsz))]
 fn test_from_sz() {
     let file_name = format!("{TMP_DIR}/from_sz.bin");
     let mut file = std::fs::File::create(&file_name).unwrap();
@@ -64,7 +64,7 @@ fn test_from_sz() {
 }
 
 #[test]
-#[cfg(all(host_has_rzsz, feature = "integration_test"))]
+#[cfg(all(host_has_rzsz))]
 fn test_to_rz() {
     let file_name = format!("{TMP_DIR}/to_rz.bin");
     std::fs::remove_file(&file_name).unwrap_or_default();
