@@ -31,3 +31,13 @@ name = "rzm"
 
 [[example]]
 name = "szm"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = true
+
+[[test]]
+name = "protocol"
+path = "tests/protocol.rs"
+harness = true
