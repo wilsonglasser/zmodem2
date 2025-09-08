@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0"
 argh = "0.1"
 indicatif = "0.17"
-zmodem2 = { path = "../zmodem2" }
+zmodem2 = { path = "../zmodem2", version = "0.1.4" }
 
 [[bin]]
 name = "rzm"
