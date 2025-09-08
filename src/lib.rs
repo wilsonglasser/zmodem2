@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2017-2020 Alexey Arbuzov
+// Copyright (c) 2023-2025 Jarkko Sakkinen
+
 //! ZMODEM file transfer protocol crate. `zmodem2::receive` and `zmodem2::send`
 //! provide a synchronous and sequential API for sending and receiving files
 //! with the ZMODEM protocol. Each step corresponds to a single ZMODEM frame
