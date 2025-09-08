@@ -1,43 +1,6 @@
-[package]
-authors = ["jarkkojs", "aarbuzov"]
-name = "zmodem2"
-description = "ZMODEM file transfer protocol"
-repository = "https://codeberg.org/jarkko/zmodem2.git"
-license = "MIT OR Apache-2.0"
-version = "0.1.3"
-edition = "2021"
-rust-version = "1.73"
-
-[features]
-default = ["std"]
-std = []
-
-[dependencies]
-bitflags = "2.4"
-crc = "3.0"
-heapless = "0.8"
-hex = { version = "0.4", default-features = false }
-strum = { version = "0.27", default-features=false, features = ["derive"] }
-strum_macros = { version = "0.27", default-features=false }
-tinyvec = "1.6.0"
-
-[dev-dependencies]
-clap = { version = "4.4", features = ["derive"] }
-rstest = "0.25"
-indicatif = "0.17"
-
-[[example]]
-name = "rzm"
-
-[[example]]
-name = "szm"
-
-[[test]]
-name = "integration"
-path = "tests/integration.rs"
-harness = true
-
-[[test]]
-name = "protocol"
-path = "tests/protocol.rs"
-harness = true
+[workspace]
+resolver = "2"
+members = [
+    "zmodem2",
+    "zmodem2-bin",
+]

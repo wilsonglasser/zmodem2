@@ -1,8 +1,18 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2017-2020 Alexey Arbuzov
+// Copyright (c) 2023-2025 Jarkko Sakkinen
+
 use std::io::{stdin, stdout, Read, Result, Stdin, Stdout, Write};
 
 pub struct CombinedStdInOut {
     stdin: Stdin,
     stdout: Stdout,
+}
+
+impl Default for CombinedStdInOut {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CombinedStdInOut {

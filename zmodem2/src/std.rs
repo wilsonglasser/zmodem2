@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2017-2020 Alexey Arbuzov
+// Copyright (c) 2023-2025 Jarkko Sakkinen
+
 use super::{Encoding, Error, Frame, Header, Packet, Read, Seek, Write};
 use std::{fmt, io::SeekFrom};
 
@@ -66,3 +70,17 @@ impl fmt::Display for Packet {
         write!(f, "{:#02x}", *self as u8)
     }
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Data => write!(f, "Corrupted data received"),
+            Error::FileNameMissing => write!(f, "Filename was missing from the ZFILE packet"),
+            Error::FileNameEmpty => write!(f, "Filename was empty in the ZFILE packet"),
+            Error::Read => write!(f, "A read I/O error occurred"),
+            Error::Write => write!(f, "A write I/O error occurred"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
