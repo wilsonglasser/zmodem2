@@ -104,6 +104,10 @@ pub type Buffer = ArrayVec<[u8; BUFFER_SIZE]>;
 pub enum Error {
     /// The received data failed validation
     Data,
+    /// The field for filename is missing in the ZFILE packet
+    FileNameMissing,
+    /// Filename in the ZFILE packet has zero length
+    FileNameEmpty,
     /// I/O error during read
     Read,
     /// I/O error during write
@@ -642,8 +646,12 @@ where
         Ok(_) => {
             let payload = core::str::from_utf8(state.buf.as_slice()).map_err(|_| Error::Data)?;
             let mut fields = payload.split('\0');
-            state.file_name =
-                String::from_str(fields.next().unwrap_or("")).map_err(|()| Error::Data)?;
+
+            let file_name = fields.next().ok_or(Error::FileNameMissing)?;
+            if file_name.is_empty() {
+                return Err(Error::FileNameEmpty);
+            }
+            state.file_name = String::from_str(file_name).map_err(|()| Error::Data)?;
 
             if let Some(size_str) = fields.next() {
                 if let Some(field) = size_str.split_ascii_whitespace().next() {
