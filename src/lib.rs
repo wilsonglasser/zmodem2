@@ -563,10 +563,13 @@ where
     if state.stage == Stage::Waiting {
         write_zrinit(port)?;
     }
-
-    read_zpad(port)?;
-
-    let header = Header::read(port)?;
+    if read_zpad(port).is_err() {
+        return Ok(());
+    }
+    let Ok(header) = Header::read(port) else {
+        ZNAK_HEADER.write(port)?;
+        return Ok(());
+    };
     match header.frame() {
         Frame::ZFILE => {
             if state.stage == Stage::Waiting || state.stage == Stage::Ready {
