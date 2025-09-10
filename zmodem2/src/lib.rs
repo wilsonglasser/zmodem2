@@ -12,8 +12,8 @@
 //!
 //! 1. Create `zmodem2::State`.
 //! 2. Call either `zmodem2::send` or `zmodem2::receive`.
-//! 3. If the returned `zmodem2::Stage` is not yet `zmodem2::Stage::Done`, go
-//!    back to step 2.
+//! 3. If the returned `zmodem2::Stage` is not yet `zmodem2::Stage::FileEnd`,
+//!    go back to step 2.
 
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
@@ -408,7 +408,7 @@ impl State {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            stage: Stage::Waiting,
+            stage: Stage::SessionBegin,
             count: 0,
             file_name: String::new(),
             file_size: 0,
@@ -426,7 +426,7 @@ impl State {
     pub fn new_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
         let file_name = String::from_str(file_name).or(Err(Error::Data))?;
         Ok(Self {
-            stage: Stage::Waiting,
+            stage: Stage::SessionBegin,
             count: 0,
             file_name,
             file_size,
@@ -455,12 +455,13 @@ impl State {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
-    Waiting,
-    Ready,
-    InProgress,
-    Done,
+    FileBegin,
+    FileEnd,
+    FileInProgress,
+    SessionBegin,
+    SessionEnd,
 }
 
 /// Sends a file using the ZMODEM file transfer protocol.
@@ -475,42 +476,40 @@ where
     P: Read + Write + ?Sized,
     F: Read + Seek + ?Sized,
 {
-    if state.stage == Stage::Waiting {
+    if state.stage == Stage::SessionBegin {
         ZRQINIT_HEADER.write(port)?;
     }
-    if read_zpad(port).is_err() {
-        return Ok(());
+
+    match read_zpad(port) {
+        Ok(()) => (),
+        Err(Error::Data) => return Ok(()),
+        Err(e) => return Err(e),
     }
-    let Ok(frame) = Header::read(port) else {
+
+    let Ok(header) = Header::read(port) else {
         ZNAK_HEADER.write(port)?;
         return Ok(());
     };
-    match frame.frame() {
+
+    match header.frame() {
         Frame::ZRINIT => {
-            if state.stage == Stage::Waiting {
+            if state.stage == Stage::SessionBegin {
                 write_zfile(port, &mut state.buf, &state.file_name, state.file_size)?;
-                state.stage = Stage::Ready;
-            } else if state.stage == Stage::InProgress {
-                ZFIN_HEADER.write(port)?;
+                state.stage = Stage::FileBegin;
+            } else if state.stage == Stage::FileInProgress {
+                state.stage = Stage::FileEnd;
             }
         }
         Frame::ZRPOS | Frame::ZACK => {
-            if state.stage == Stage::Waiting {
+            if state.stage == Stage::SessionBegin {
                 ZRQINIT_HEADER.write(port)?;
-            } else if state.stage == Stage::Ready || state.stage == Stage::InProgress {
-                write_zdata(port, &mut state.buf, file, frame.count())?;
-                state.stage = Stage::InProgress;
-            }
-        }
-        Frame::ZFIN => {
-            if state.stage == Stage::InProgress {
-                port.write_byte(b'O')?;
-                port.write_byte(b'O')?;
-                state.stage = Stage::Done;
+            } else if state.stage == Stage::FileBegin || state.stage == Stage::FileInProgress {
+                write_zdata(port, &mut state.buf, file, header.count())?;
+                state.stage = Stage::FileInProgress;
             }
         }
         _ => {
-            if state.stage == Stage::Waiting {
+            if state.stage == Stage::SessionBegin {
                 ZRQINIT_HEADER.write(port)?;
             }
         }
@@ -530,7 +529,7 @@ where
     P: Read + Write + ?Sized,
     F: Write + ?Sized,
 {
-    if state.stage == Stage::Waiting {
+    if state.stage == Stage::SessionBegin {
         write_zrinit(port)?;
     }
     if read_zpad(port).is_err() {
@@ -542,36 +541,72 @@ where
     };
     match header.frame() {
         Frame::ZFILE => {
-            if state.stage == Stage::Waiting || state.stage == Stage::Ready {
+            if state.stage == Stage::SessionBegin || state.stage == Stage::FileBegin {
                 read_zfile(port, state, header.encoding())?;
-                state.stage = Stage::Ready;
+                state.stage = Stage::FileBegin;
             }
         }
         Frame::ZDATA => {
-            if state.stage == Stage::Waiting {
+            if state.stage == Stage::SessionBegin {
                 write_zrinit(port)?;
-            } else if state.stage == Stage::Ready || state.stage == Stage::InProgress {
+            } else if state.stage == Stage::FileBegin || state.stage == Stage::FileInProgress {
                 if header.count() != state.count {
                     ZRPOS_HEADER.with_count(state.count).write(port)?;
                     return Ok(());
                 }
                 read_zdata(port, state, header.encoding(), file)?;
-                state.stage = Stage::InProgress;
+                state.stage = Stage::FileInProgress;
             }
         }
         Frame::ZEOF => {
-            if state.stage == Stage::InProgress && header.count() == state.count {
+            if state.stage == Stage::FileInProgress && header.count() == state.count {
                 write_zrinit(port)?;
             }
         }
         Frame::ZFIN => {
-            if state.stage == Stage::InProgress {
+            if state.stage == Stage::FileInProgress || state.stage == Stage::FileBegin {
                 ZFIN_HEADER.write(port)?;
-                state.stage = Stage::Done;
+                state.stage = Stage::FileEnd;
             }
         }
         _ => (),
     }
+    Ok(())
+}
+
+/// Send ZFIN.
+///
+/// # Errors
+///
+/// * `Err(Error::Read)` when the read I/O fails with the serial port
+/// * `Err(Error::Write)` when the write I/O fails with the serial port
+/// * `Err(Error::Data)` when corrupted data has been detected
+pub fn finish<P>(port: &mut P, state: &mut State) -> Result<(), Error>
+where
+    P: Read + Write + ?Sized,
+{
+    ZFIN_HEADER.write(port)?;
+
+    if read_zpad(port).is_err() {
+        return Ok(());
+    }
+
+    let Ok(frame) = Header::read(port) else {
+        ZNAK_HEADER.write(port)?;
+        return Ok(());
+    };
+
+    match frame.frame() {
+        Frame::ZFIN => {
+            port.write_byte(b'O')?;
+            port.write_byte(b'O')?;
+            state.stage = Stage::SessionEnd;
+        }
+        _ => {
+            ZFIN_HEADER.write(port)?;
+        }
+    }
+
     Ok(())
 }
 

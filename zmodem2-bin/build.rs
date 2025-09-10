@@ -13,13 +13,13 @@ fn main() {
         .arg("-c")
         .arg("command -v rz")
         .status()
-        .map_or(false, |s| s.success());
+        .is_ok_and(|s| s.success());
 
     let sz_exists = Command::new("sh")
         .arg("-c")
         .arg("command -v sz")
         .status()
-        .map_or(false, |s| s.success());
+        .is_ok_and(|s| s.success());
 
     if rz_exists && sz_exists {
         println!("cargo:rustc-cfg=host_has_rzsz");
