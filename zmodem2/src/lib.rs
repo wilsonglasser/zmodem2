@@ -19,13 +19,13 @@
 #![deny(clippy::pedantic)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod crc;
 #[cfg(feature = "std")]
 mod std;
 mod zdle;
 
 use bitflags::bitflags;
 use core::{convert::TryFrom, str::FromStr};
-use crc::{Crc, CRC_16_XMODEM, CRC_32_ISO_HDLC};
 use heapless::String;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -40,12 +40,6 @@ const HEADER_SIZE: usize = 32;
 
 /// The number of subpackets to stream
 const SUBPACKET_PER_ACK: usize = 10;
-
-/// CRC algorithm for `ZBIN` or `ZHEX` encoded transmissions.
-const CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_XMODEM);
-
-/// CRC algorithm for `ZBIN32` encoded transmissions.
-const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 pub const ZPAD: u8 = b'*';
 pub const ZDLE: u8 = 0x18;
@@ -862,16 +856,20 @@ where
     port.write_byte(kind)?;
     match encoding {
         Encoding::ZBIN32 => {
-            let mut digest = CRC32.digest();
-            digest.update(data);
-            digest.update(&[kind]);
-            write_slice_escaped(port, &digest.finalize().to_le_bytes())
+            let mut buf = [0u8; 4];
+            let mut new_data = data.to_vec();
+            new_data.push(kind);
+            let crc = crc::crc32_iso_hdlc(&new_data).to_le_bytes();
+            buf.copy_from_slice(&crc);
+            write_slice_escaped(port, &buf)
         }
         Encoding::ZBIN => {
-            let mut digest = CRC16.digest();
-            digest.update(data);
-            digest.update(&[kind]);
-            write_slice_escaped(port, &digest.finalize().to_be_bytes())
+            let mut buf = [0u8; 2];
+            let mut new_data = data.to_vec();
+            new_data.push(kind);
+            let crc = crc::crc16_xmodem(&new_data).to_be_bytes();
+            buf.copy_from_slice(&crc);
+            write_slice_escaped(port, &buf)
         }
         Encoding::ZHEX => {
             unimplemented!()
@@ -891,11 +889,11 @@ fn check_crc(data: &[u8], crc: &[u8], encoding: Encoding) -> Result<(), Error> {
 
 fn make_crc(data: &[u8], out: &mut [u8], encoding: Encoding) -> usize {
     if encoding == Encoding::ZBIN32 {
-        let crc = CRC32.checksum(data).to_le_bytes();
+        let crc = crate::crc::crc32_iso_hdlc(data).to_le_bytes();
         out[..4].copy_from_slice(&crc[..4]);
         4
     } else {
-        let crc = CRC16.checksum(data).to_be_bytes();
+        let crc = crate::crc::crc16_xmodem(data).to_be_bytes();
         out[..2].copy_from_slice(&crc[..2]);
         2
     }
