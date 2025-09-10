@@ -26,7 +26,6 @@ pub const fn crc16_xmodem(data: &[u8]) -> u16 {
     crc
 }
 
-
 /// Computes the CRC-32-ISO-HDLC checksum.
 #[must_use]
 pub const fn crc32_iso_hdlc(data: &[u8]) -> u32 {

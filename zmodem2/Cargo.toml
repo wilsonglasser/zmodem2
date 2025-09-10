@@ -6,7 +6,7 @@ repository = "https://codeberg.org/jarkko/zmodem2.git"
 license = "MIT OR Apache-2.0"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.73"
+rust-version = "1.78"
 
 [features]
 default = ["std"]
