@@ -19,17 +19,19 @@
 #![deny(clippy::pedantic)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod buffer;
 mod crc;
 #[cfg(feature = "std")]
 mod std;
 mod zdle;
+
+pub use buffer::*;
 
 use bitflags::bitflags;
 use core::{convert::TryFrom, str::FromStr};
 use heapless::String;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
-use tinyvec::{array_vec, ArrayVec};
 
 /// Size of the unescaped subpacket payload. The size was picked based on
 /// maximum subpacket size in the original 1988 ZMODEM specification.
@@ -53,12 +55,11 @@ const ZNAK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZNAK, &[0; 4]);
 const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, &[0; 4]);
 const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 4]);
 
-/// Staging and temporal storage for incoming and outgoing frames
-pub type Buffer = ArrayVec<[u8; BUFFER_SIZE]>;
-
 /// Error codes for `zmodem2::send` and `zmodem2::receive`
 #[derive(Debug, PartialEq)]
 pub enum Error {
+    /// Buffer or other compile-time set capacity exceeded
+    CapacityExceeded(usize),
     /// The received data failed validation
     Data,
     /// The field for filename is missing in the ZFILE packet
@@ -177,19 +178,19 @@ impl Header {
     where
         P: Write + ?Sized,
     {
-        let mut out = array_vec!([u8; HEADER_SIZE]);
+        let mut out: Buffer<HEADER_SIZE> = Buffer::new();
         port.write_byte(ZPAD)?;
         if self.encoding == Encoding::ZHEX {
             port.write_byte(ZPAD)?;
         }
         port.write_byte(ZDLE)?;
         port.write_byte(self.encoding as u8)?;
-        out.push(self.frame as u8);
-        out.extend_from_slice(&self.flags);
+        out.push(self.frame as u8)?;
+        out.extend_from_slice(&self.flags)?;
         // Skips ZPAD and encoding:
         let mut crc = [0u8; 4];
         let crc_len = make_crc(&out, &mut crc, self.encoding);
-        out.extend_from_slice(&crc[..crc_len]);
+        out.extend_from_slice(&crc[..crc_len])?;
         // Skips ZPAD and encoding:
         if self.encoding == Encoding::ZHEX {
             let mut hexbuf = [0u8; HEADER_SIZE];
@@ -197,10 +198,10 @@ impl Header {
             if len > hexbuf.len() {
                 return Err(Error::Data);
             }
-            let hex = &mut hexbuf[..len];
-            hex::encode_to_slice(out, hex).map_err(|_| Error::Data)?;
-            out.truncate(0);
-            out.extend_from_slice(hex);
+            let hex_slice = &mut hexbuf[..len];
+            hex::encode_to_slice(&out, hex_slice).map_err(|_| Error::Data)?;
+            out.clear();
+            out.extend_from_slice(hex_slice)?;
         }
         write_slice_escaped(port, &out)?;
         if self.encoding == Encoding::ZHEX {
@@ -227,16 +228,19 @@ impl Header {
         P: Read + ?Sized,
     {
         let encoding = Encoding::try_from(port.read_byte()?)?;
-        let mut out_hex = array_vec!([u8; HEADER_SIZE]);
+        let mut out_hex: Buffer<HEADER_SIZE> = Buffer::new();
         for _ in 0..Header::unescaped_size(encoding) - 1 {
-            out_hex.push(read_byte_unescaped(port)?);
+            out_hex.push(read_byte_unescaped(port)?)?;
         }
-        let mut out = array_vec!([u8; HEADER_SIZE]);
-        out.set_len(out_hex.len() / 2);
+        let mut out: Buffer<HEADER_SIZE> = Buffer::new();
         if encoding == Encoding::ZHEX {
-            hex::decode_to_slice(out_hex, &mut out).map_err(|_| Error::Data)?;
+            let mut decoded_bytes = [0u8; HEADER_SIZE / 2];
+            let decoded_len = out_hex.len() / 2;
+            hex::decode_to_slice(&out_hex, &mut decoded_bytes[..decoded_len])
+                .map_err(|_| Error::Data)?;
+            out.extend_from_slice(&decoded_bytes[..decoded_len])?;
         } else {
-            out = out_hex;
+            out.extend_from_slice(&out_hex)?;
         }
         check_crc(&out[..5], &out[5..], encoding)?;
         let frame = Frame::try_from(out[0])?;
@@ -388,7 +392,7 @@ pub struct State {
     count: u32,
     file_name: String<256>,
     file_size: u32,
-    buf: Buffer,
+    buf: Buffer<BUFFER_SIZE>,
 }
 
 impl Default for State {
@@ -406,7 +410,7 @@ impl State {
             count: 0,
             file_name: String::new(),
             file_size: 0,
-            buf: Buffer::from_array_empty([0; BUFFER_SIZE]),
+            buf: Buffer::<BUFFER_SIZE>::new(),
         }
     }
 
@@ -424,7 +428,7 @@ impl State {
             count: 0,
             file_name,
             file_size,
-            buf: Buffer::from_array_empty([0; BUFFER_SIZE]),
+            buf: Buffer::<BUFFER_SIZE>::new(),
         })
     }
 
@@ -498,7 +502,7 @@ where
             if state.stage == Stage::SessionBegin {
                 ZRQINIT_HEADER.write(port)?;
             } else if state.stage == Stage::FileBegin || state.stage == Stage::FileInProgress {
-                write_zdata(port, &mut state.buf, file, header.count())?;
+                write_zdata(port, file, header.count())?;
                 state.stage = Stage::FileInProgress;
             }
         }
@@ -614,16 +618,21 @@ where
 }
 
 /// Write ZRFILE
-fn write_zfile<P>(port: &mut P, buf: &mut Buffer, name: &str, size: u32) -> Result<(), Error>
+fn write_zfile<P>(
+    port: &mut P,
+    buf: &mut Buffer<BUFFER_SIZE>,
+    name: &str,
+    size: u32,
+) -> Result<(), Error>
 where
     P: Write + ?Sized,
 {
     let size = String::<17>::try_from(size).or(Err(Error::Data))?;
     buf.clear();
-    buf.extend_from_slice(name.as_bytes());
-    buf.push(b'\0');
-    buf.extend_from_slice(size.as_ref());
-    buf.push(b'\0');
+    buf.extend_from_slice(name.as_bytes())?;
+    buf.push(b'\0')?;
+    buf.extend_from_slice(size.as_ref())?;
+    buf.push(b'\0')?;
     Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4]).write(port)?;
     write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, buf)
 }
@@ -636,7 +645,7 @@ where
 {
     match read_subpacket(port, &mut state.buf, encoding) {
         Ok(_) => {
-            let payload = core::str::from_utf8(state.buf.as_slice()).map_err(|_| Error::Data)?;
+            let payload = core::str::from_utf8(&state.buf).map_err(|_| Error::Data)?;
             let mut fields = payload.split('\0');
 
             let file_name = fields.next().ok_or(Error::FileNameMissing)?;
@@ -658,40 +667,30 @@ where
 }
 
 /// Writes ZDATA
-fn write_zdata<P, F>(port: &mut P, buf: &mut Buffer, file: &mut F, offset: u32) -> Result<(), Error>
+fn write_zdata<P, F>(port: &mut P, file: &mut F, offset: u32) -> Result<(), Error>
 where
     P: Read + Write + ?Sized,
     F: Read + Seek + ?Sized,
 {
     let mut offset = offset;
-    buf.set_len(BUFFER_SIZE - 2);
+    let mut local_buf = [0u8; BUFFER_SIZE];
+    let read_buf = &mut local_buf[..BUFFER_SIZE - 2];
     file.seek(offset)?;
-    let mut count: u32 = file.read(buf)?;
+    let mut count = file.read(read_buf)? as usize;
     if count == 0 {
         ZEOF_HEADER.with_count(offset).write(port)?;
         return Ok(());
     }
     ZDATA_HEADER.with_count(offset).write(port)?;
     for _ in 1..SUBPACKET_PER_ACK {
-        write_subpacket(
-            port,
-            Encoding::ZBIN32,
-            Packet::ZCRCG,
-            &buf[..count as usize],
-        )?;
-        offset += count;
-
-        count = file.read(buf)?;
-        if (count as usize) < buf.len() {
+        write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCG, &read_buf[..count])?;
+        offset += u32::try_from(count).map_err(|_| Error::Data)?;
+        count = file.read(read_buf)? as usize;
+        if count < read_buf.len() {
             break;
         }
     }
-    write_subpacket(
-        port,
-        Encoding::ZBIN32,
-        Packet::ZCRCW,
-        &buf[..count as usize],
-    )
+    write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, &read_buf[..count])
 }
 
 /// Reads ZDATA
@@ -773,7 +772,7 @@ where
 /// pop the CRC byte, which should not happen in a valid transmission.
 pub fn read_subpacket<P>(
     port: &mut P,
-    buf: &mut Buffer,
+    buf: &mut Buffer<BUFFER_SIZE>,
     encoding: Encoding,
 ) -> Result<Packet, Error>
 where
@@ -785,17 +784,17 @@ where
         if byte == ZDLE {
             let byte = port.read_byte()?;
             if let Ok(packet) = Packet::try_from(byte) {
-                buf.push(packet as u8);
+                buf.push(packet as u8)?;
                 break packet;
             }
-            buf.push(zdle::UNZDLE_TABLE[byte as usize]);
+            buf.push(zdle::UNZDLE_TABLE[byte as usize])?;
         } else {
-            buf.push(byte);
+            buf.push(byte)?;
         }
 
         if buf.len() == buf.capacity() {
             let packet = skip_subpacket_tail(port, encoding)?;
-            buf.set_len(0);
+            buf.clear();
             return Ok(packet);
         }
     };
@@ -850,24 +849,30 @@ pub fn write_subpacket<P>(
 where
     P: Write + ?Sized,
 {
+    const CRC_BUF_SIZE: usize = BUFFER_SIZE + 1;
+
     let kind = kind as u8;
     write_slice_escaped(port, data)?;
     port.write_byte(ZDLE)?;
     port.write_byte(kind)?;
     match encoding {
         Encoding::ZBIN32 => {
+            let mut crc_buf: Buffer<CRC_BUF_SIZE> = Buffer::new();
+            crc_buf.extend_from_slice(data)?;
+            crc_buf.push(kind)?;
+
             let mut buf = [0u8; 4];
-            let mut new_data = data.to_vec();
-            new_data.push(kind);
-            let crc = crc::crc32_iso_hdlc(&new_data).to_le_bytes();
+            let crc = crc::crc32_iso_hdlc(&crc_buf).to_le_bytes();
             buf.copy_from_slice(&crc);
             write_slice_escaped(port, &buf)
         }
         Encoding::ZBIN => {
+            let mut crc_buf: Buffer<CRC_BUF_SIZE> = Buffer::new();
+            crc_buf.extend_from_slice(data)?;
+            crc_buf.push(kind)?;
+
             let mut buf = [0u8; 2];
-            let mut new_data = data.to_vec();
-            new_data.push(kind);
-            let crc = crc::crc16_xmodem(&new_data).to_be_bytes();
+            let crc = crc::crc16_xmodem(&crc_buf).to_be_bytes();
             buf.copy_from_slice(&crc);
             write_slice_escaped(port, &buf)
         }

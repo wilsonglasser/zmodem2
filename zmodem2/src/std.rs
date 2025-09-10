@@ -74,9 +74,10 @@ impl fmt::Display for Packet {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Data => write!(f, "Corrupted data received"),
-            Error::FileNameMissing => write!(f, "Filename was missing from the ZFILE packet"),
-            Error::FileNameEmpty => write!(f, "Filename was empty in the ZFILE packet"),
+            Error::CapacityExceeded(c) => write!(f, "capacity {c} exceeded"),
+            Error::Data => write!(f, "data corruption"),
+            Error::FileNameMissing => write!(f, "filename missing from ZFILE"),
+            Error::FileNameEmpty => write!(f, "filename empty in ZFILE"),
             Error::Read => write!(f, "A read I/O error occurred"),
             Error::Write => write!(f, "A write I/O error occurred"),
         }
