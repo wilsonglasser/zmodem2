@@ -10,34 +10,29 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use zmodem2_bin::{CombinedStdInOut, ReadWrite};
+use zmodem2_bin::ReadWrite;
 
 #[derive(FromArgs, Debug)]
 /// Receive files using the ZMODEM protocol.
 struct Arguments {
-    /// default is '/dev/ttyS0'. Use '-' for stdio.
-    #[argh(option, short = 'p')]
-    port: Option<String>,
-    /// download path
+    /// device file [default: /dev/ttyS0]
+    #[argh(option, short = 'p', default = "String::from(\"/dev/ttyS0\")")]
+    port: String,
+    /// download directory
     #[argh(positional)]
-    path: Option<String>,
+    path: String,
 }
 
 fn main() -> anyhow::Result<()> {
     let args: Arguments = argh::from_env();
-    let mut port: Box<dyn ReadWrite> = {
-        let path = args.port.as_deref().unwrap_or("/dev/ttyS0");
-        if path == "-" {
-            Box::new(CombinedStdInOut::new())
-        } else {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .with_context(|| format!("'{path}'"))?;
-            Box::new(file)
-        }
-    };
+
+    let mut port: Box<dyn ReadWrite> = Box::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&args.port)
+            .with_context(|| format!("'{}'", args.port))?,
+    );
 
     let mut state = zmodem2::State::new();
     let mut buf = vec![];
@@ -53,11 +48,14 @@ fn main() -> anyhow::Result<()> {
             Component::Normal(name) => Some(name),
             _ => None,
         })
-        .with_context(|| format!("invalid filename '{}'", state.file_name()))?;
-    let path = match &args.path {
-        Some(p) => PathBuf::from(p),
-        None => PathBuf::from(received_filename),
-    };
+        .with_context(|| format!("malformed filename: '{}'", state.file_name()))?;
+
+    let dest_dir = PathBuf::from(args.path);
+    if !dest_dir.is_dir() {
+        bail!("'{}' is not a directory", dest_dir.display());
+    }
+    let path = dest_dir.join(received_filename);
+
     let pb = ProgressBar::new(state.file_size() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -67,7 +65,8 @@ fn main() -> anyhow::Result<()> {
             .progress_chars("=>-"),
     );
     pb.set_message(format!("Receiving {}", path.display()));
-    let mut file = File::create(&path).with_context(|| format!("'{}'", path.display()))?;
+    let mut file =
+        File::create(&path).with_context(|| format!("could not create '{}'", path.display()))?;
     file.write_all(&buf)?;
     while state.stage() != zmodem2::Stage::SessionEnd {
         if let Err(e) = zmodem2::receive(&mut port, &mut file, &mut state) {

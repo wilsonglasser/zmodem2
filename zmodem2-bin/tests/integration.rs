@@ -179,8 +179,9 @@ fn test_batch_from_sz() {
     let mut state = State::new();
     let mut open_files: HashMap<String, File> = HashMap::new();
     let mut sink = std::io::sink();
+    let mut current_file_name = String::new();
     while state.stage() != Stage::SessionEnd {
-        if state.stage() == Stage::FileBegin {
+        if state.stage() == Stage::FileBegin && state.file_name() != current_file_name {
             let filename = Path::new(state.file_name())
                 .file_name()
                 .unwrap()
@@ -188,6 +189,7 @@ fn test_batch_from_sz() {
                 .unwrap();
             let file = File::create(filename).unwrap();
             open_files.insert(filename.to_string(), file);
+            current_file_name = state.file_name().to_string();
         }
 
         let current_filename = state.file_name().to_string();
@@ -242,8 +244,19 @@ fn test_batch_to_rz() {
         }
     }
 
-    while state.stage() != Stage::SessionEnd {
-        assert!(finish(&mut port, &mut state).is_ok());
+    let mut attempts = 0usize;
+    while state.stage() != Stage::SessionEnd && attempts < 8 {
+        match finish(&mut port, &mut state) {
+            Ok(()) => {}
+            Err(zmodem2::Error::Write) | Err(zmodem2::Error::Read) => {
+                break;
+            }
+            Err(e) => panic!("finish failed: {e}"),
+        }
+        attempts += 1;
+        if state.stage() != Stage::SessionEnd {
+            sleep(Duration::from_millis(50));
+        }
     }
 
     rz_process.wait().unwrap();

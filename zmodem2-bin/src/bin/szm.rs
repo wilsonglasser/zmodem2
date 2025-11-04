@@ -9,15 +9,15 @@ use argh::FromArgs;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use zmodem2_bin::{CombinedStdInOut, ReadWrite};
+use zmodem2_bin::ReadWrite;
 
 #[derive(FromArgs, Debug)]
-/// Send files using the ZMODEM protocol.
+/// Sends files using the ZMODEM protocol.
 struct Arguments {
-    /// default is '/dev/ttyS0'. Use '-' for stdio.
-    #[argh(option, short = 'p')]
-    port: Option<String>,
-    /// list of files to send
+    /// device file [default: /dev/ttyS0]
+    #[argh(option, short = 'p', default = "String::from(\"/dev/ttyS0\")")]
+    port: String,
+    /// list of files
     #[argh(positional)]
     paths: Vec<String>,
 }
@@ -25,21 +25,16 @@ struct Arguments {
 fn main() -> anyhow::Result<()> {
     let args: Arguments = argh::from_env();
     if args.paths.is_empty() {
-        bail!("no files");
+        std::process::exit(2);
     }
-    let mut port: Box<dyn ReadWrite> = {
-        let path = args.port.as_deref().unwrap_or("/dev/ttyS0");
-        if path == "-" {
-            Box::new(CombinedStdInOut::new())
-        } else {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .with_context(|| format!("'{path}'"))?;
-            Box::new(file)
-        }
-    };
+
+    let mut port: Box<dyn ReadWrite> = Box::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&args.port)
+            .with_context(|| format!("'{}'", args.port))?,
+    );
     let mut state = zmodem2::State::new();
     for path in &args.paths {
         let mut file = File::open(path).with_context(|| format!("'{path}'"))?;

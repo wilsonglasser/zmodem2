@@ -34,9 +34,12 @@ use heapless::String;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
-/// Size of the unescaped subpacket payload. The size was picked based on
-/// maximum subpacket size in the original 1988 ZMODEM specification.
-const BUFFER_SIZE: usize = 1024;
+/// Size of the unescaped subpacket payload. The size is picked from the
+/// original ZMODEM specification.
+const SUBPACKET_MAX_SIZE: usize = 1024;
+
+/// Size of the unescaped payload plus one byte for CRC type storage.
+const SUBPACKET_CRC_MAX_SIZE: usize = SUBPACKET_MAX_SIZE + 1;
 
 /// Buffer size with enough capacity for an escaped header
 const HEADER_SIZE: usize = 32;
@@ -273,7 +276,7 @@ impl Header {
 /// The ZMODEM protocol frame encoding
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, EnumIter, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
 pub enum Encoding {
     ZBIN = 0x41,
     ZHEX = 0x42,
@@ -292,7 +295,7 @@ impl TryFrom<u8> for Encoding {
 
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, EnumIter, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
 /// Frame types
 pub enum Frame {
     /// Request receive init
@@ -370,7 +373,7 @@ bitflags! {
 /// The ZMODEM protocol subpacket type
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, EnumIter, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
 pub enum Packet {
     ZCRCE = 0x68,
     ZCRCG = 0x69,
@@ -394,7 +397,7 @@ pub struct State {
     count: u32,
     file_name: String<256>,
     file_size: u32,
-    buf: Buffer<BUFFER_SIZE>,
+    buf: Buffer<SUBPACKET_CRC_MAX_SIZE>,
 }
 
 impl Default for State {
@@ -412,7 +415,7 @@ impl State {
             count: 0,
             file_name: String::new(),
             file_size: 0,
-            buf: Buffer::<BUFFER_SIZE>::new(),
+            buf: Buffer::<SUBPACKET_CRC_MAX_SIZE>::new(),
         }
     }
 
@@ -430,7 +433,7 @@ impl State {
             count: 0,
             file_name,
             file_size,
-            buf: Buffer::<BUFFER_SIZE>::new(),
+            buf: Buffer::<SUBPACKET_CRC_MAX_SIZE>::new(),
         })
     }
 
@@ -482,7 +485,9 @@ where
 
     match read_zpad(port) {
         Ok(()) => (),
-        Err(Error::Data) => return Ok(()),
+        Err(Error::Data) => {
+            return Ok(());
+        }
         Err(e) => return Err(e),
     }
 
@@ -561,15 +566,16 @@ where
         Frame::ZEOF => {
             if state.stage == Stage::FileInProgress && header.count() == state.count {
                 write_zrinit(port)?;
+                state.stage = Stage::FileBegin;
             }
         }
         Frame::ZFIN => {
             if state.stage == Stage::FileInProgress || state.stage == Stage::FileBegin {
                 ZFIN_HEADER.write(port)?;
-                state.stage = Stage::FileEnd;
+                state.stage = Stage::SessionEnd;
             }
         }
-        _ => (),
+        _ => {}
     }
     Ok(())
 }
@@ -622,7 +628,7 @@ where
 /// Write ZRFILE
 fn write_zfile<P>(
     port: &mut P,
-    buf: &mut Buffer<BUFFER_SIZE>,
+    buf: &mut Buffer<SUBPACKET_CRC_MAX_SIZE>,
     name: &str,
     size: u32,
 ) -> Result<(), Error>
@@ -662,6 +668,8 @@ where
                 }
             }
 
+            state.count = 0;
+
             ZRPOS_HEADER.with_count(0).write(port)
         }
         _ => ZNAK_HEADER.write(port).map_err(|_| Error::Data),
@@ -675,8 +683,8 @@ where
     F: Read + Seek + ?Sized,
 {
     let mut offset = offset;
-    let mut local_buf = [0u8; BUFFER_SIZE];
-    let read_buf = &mut local_buf[..BUFFER_SIZE - 2];
+    let mut local_buf = [0u8; SUBPACKET_MAX_SIZE];
+    let read_buf = &mut local_buf[..SUBPACKET_MAX_SIZE - 2];
     file.seek(offset)?;
     let mut count = file.read(read_buf)? as usize;
     if count == 0 {
@@ -708,12 +716,7 @@ where
 {
     loop {
         let zcrc = match read_subpacket(port, &mut state.buf, encoding) {
-            Ok(zcrc) => {
-                if state.buf.is_empty() {
-                    ZRPOS_HEADER.with_count(state.count).write(port)?;
-                }
-                zcrc
-            }
+            Ok(zcrc) => zcrc,
             Err(Error::Data) => {
                 ZNAK_HEADER.with_count(state.count).write(port)?;
                 continue;
@@ -727,7 +730,9 @@ where
                 ZACK_HEADER.with_count(state.count).write(port)?;
                 return Ok(());
             }
-            Packet::ZCRCE => return Ok(()),
+            Packet::ZCRCE => {
+                return Ok(());
+            }
             Packet::ZCRCQ => {
                 ZACK_HEADER.with_count(state.count).write(port)?;
             }
@@ -774,7 +779,7 @@ where
 /// pop the CRC byte, which should not happen in a valid transmission.
 pub fn read_subpacket<P>(
     port: &mut P,
-    buf: &mut Buffer<BUFFER_SIZE>,
+    buf: &mut Buffer<SUBPACKET_CRC_MAX_SIZE>,
     encoding: Encoding,
 ) -> Result<Packet, Error>
 where
@@ -851,15 +856,13 @@ pub fn write_subpacket<P>(
 where
     P: Write + ?Sized,
 {
-    const CRC_BUF_SIZE: usize = BUFFER_SIZE + 1;
-
     let kind = kind as u8;
     write_slice_escaped(port, data)?;
     port.write_byte(ZDLE)?;
     port.write_byte(kind)?;
     match encoding {
         Encoding::ZBIN32 => {
-            let mut crc_buf: Buffer<CRC_BUF_SIZE> = Buffer::new();
+            let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
             crc_buf.extend_from_slice(data)?;
             crc_buf.push(kind)?;
 
@@ -869,7 +872,7 @@ where
             write_slice_escaped(port, &buf)
         }
         Encoding::ZBIN => {
-            let mut crc_buf: Buffer<CRC_BUF_SIZE> = Buffer::new();
+            let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
             crc_buf.extend_from_slice(data)?;
             crc_buf.push(kind)?;
 
