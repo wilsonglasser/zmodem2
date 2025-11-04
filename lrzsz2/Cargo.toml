@@ -1,10 +1,10 @@
 [package]
 authors = ["jarkkojs", "aarbuzov"]
 name = "lrzsz2"
-description = "ZMODEM file transfer protocol"
+description = "ZMODEM file transfer utilities"
 repository = "https://codeberg.org/jarkko/zmodem2.git"
 license = "MIT OR Apache-2.0"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.73"
 
@@ -12,7 +12,7 @@ rust-version = "1.73"
 anyhow = "1.0"
 argh = "0.1"
 indicatif = "0.17"
-zmodem2 = { path = "../zmodem2", version = "0.2.0" }
+zmodem2 = { path = "../zmodem2", version = "0.3.0" }
 
 [[bin]]
 name = "rz2"
