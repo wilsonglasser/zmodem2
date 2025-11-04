@@ -1,6 +1,29 @@
-[workspace]
-resolver = "2"
-members = [
-    "zmodem2",
-    "lrzsz2",
-]
+[package]
+authors = ["jarkkojs", "aarbuzov"]
+description = "ZMODEM file transfer protocol"
+edition = "2021"
+homepage = "https://codeberg.org/jarkko/zmodem2"
+license = "MIT OR Apache-2.0"
+name = "zmodem2"
+repository = "https://codeberg.org/jarkko/zmodem2.git"
+rust-version = "1.79"
+version = "0.3.1"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+bitflags = "2.4"
+heapless = "0.8"
+log = { version = "0.4", default-features = false }
+strum = { version = "0.27", default-features=false, features = ["derive"] }
+strum_macros = { version = "0.27", default-features=false }
+
+[dev-dependencies]
+rstest = "0.25"
+
+[[test]]
+name = "protocol"
+path = "tests/protocol.rs"
+harness = true
