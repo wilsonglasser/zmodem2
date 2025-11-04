@@ -7,9 +7,9 @@ extern crate zmodem2;
 use anyhow::{bail, Context};
 use argh::FromArgs;
 use indicatif::{ProgressBar, ProgressStyle};
+use lrzsz2::ReadWrite;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use zmodem2_bin::ReadWrite;
 
 #[derive(FromArgs, Debug)]
 /// Sends files using the ZMODEM protocol.

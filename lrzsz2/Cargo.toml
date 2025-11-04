@@ -1,6 +1,6 @@
 [package]
 authors = ["jarkkojs", "aarbuzov"]
-name = "zmodem2-bin"
+name = "lrzsz2"
 description = "ZMODEM file transfer protocol"
 repository = "https://codeberg.org/jarkko/zmodem2.git"
 license = "MIT OR Apache-2.0"
@@ -15,12 +15,12 @@ indicatif = "0.17"
 zmodem2 = { path = "../zmodem2", version = "0.2.0" }
 
 [[bin]]
-name = "rzm"
-path = "src/bin/rzm.rs"
+name = "rz2"
+path = "src/bin/rz2.rs"
 
 [[bin]]
-name = "szm"
-path = "src/bin/szm.rs"
+name = "sz2"
+path = "src/bin/sz2.rs"
 
 [dev-dependencies]
 env_logger = "0.10"
