@@ -8,6 +8,7 @@ name = "zmodem2"
 repository = "https://codeberg.org/jarkko/zmodem2.git"
 rust-version = "1.79"
 version = "0.3.1"
+build = "build.rs"
 
 [features]
 default = ["std"]
@@ -22,8 +23,15 @@ strum_macros = { version = "0.27", default-features=false }
 
 [dev-dependencies]
 rstest = "0.25"
+log = "0.4"
+tempfile = "3.10"
 
 [[test]]
 name = "protocol"
 path = "tests/protocol.rs"
+harness = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 harness = true
