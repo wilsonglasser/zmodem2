@@ -1,18 +1,16 @@
-# zmodem2 - ZMODEM transfer protocol crate
+# zmodem2
 
-This a library crate that implements ZMODEM transfer protocol, and is continued
-development from [zmodem](https://github.com/lexxvir/zmodem) crate by Aleksei
-Arbuzov. The crate does not use heap and can be compiled for `no_std`.
+`zmodem2` provides a ZMODEM file tranmission protocol implementation with step
+executed state by the caller. It is based on prior work of Aleksei Arbuzov in
+the [`zmodem`](https://github.com/lexxvir/zmodem) crate.
 
-# Contributing
+This crate is fully `no_std` compatible and *heapless*.
 
-1. For larger changes, please create an issue. For small and cosmetic PR's just
-   a PR is good enough.
-2. Use `Closes: #<issue>` when the issue exists.
-3. For large singular commits, preferably write also a description to the commit
-   message.
-4. Add `Signed-off-by: Firstname Lastname <email@address.com>` to the commmits
-   (i.e. `git commit -s`).
-5. Try to separate changes into
-   [logical pieces](https://www.kernel.org/doc/html/latest/process/submitting-patches.html#separate-your-changes)
-   in a pull requests with multiple commits.
+## Development
+
+* Git: https://codeberg.org/jarkko/zmodem2.git
+* Commits follow the
+  [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+  specification.
+* New commits must include a `Signed-off-by` trailer.
+* Versioning scheme uses [Semantic Versioning](https://semver.org/).

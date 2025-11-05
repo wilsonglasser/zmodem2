@@ -1,5 +1,5 @@
 [package]
-authors = ["jarkkojs", "aarbuzov"]
+authors = ["Jarkko Sakkinen <jarkko.sakkinen@iki.fi>"]
 description = "ZMODEM file transfer protocol"
 edition = "2021"
 homepage = "https://codeberg.org/jarkko/zmodem2"
@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 name = "zmodem2"
 repository = "https://codeberg.org/jarkko/zmodem2.git"
 rust-version = "1.79"
-version = "0.3.1"
+version = "0.3.2"
 build = "build.rs"
 
 [features]
