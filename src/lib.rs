@@ -76,6 +76,8 @@ pub enum Error {
     Read,
     /// I/O error during write
     Write,
+    /// A non-blocking I/O operation would block
+    WouldBlock,
 }
 
 /// Write I/O operations
