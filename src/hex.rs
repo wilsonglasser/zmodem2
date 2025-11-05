@@ -21,6 +21,15 @@ pub fn encode(data: &[u8], output: &mut [u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Converts a single hex character byte into its 4-bit value.
+fn nibble_char_to_value(c: u8) -> Result<u8, Error> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        _ => Err(Error::InvalidHex),
+    }
+}
+
 /// Decodes a hex string from `data` into `output`.
 ///
 /// # Errors
@@ -31,20 +40,9 @@ pub fn decode(data: &[u8], output: &mut [u8]) -> Result<(), Error> {
         return Err(Error::InvalidHex);
     }
     for i in 0..(data.len() / 2) {
-        let high = data[i * 2];
-        let low = data[i * 2 + 1];
-
-        let high_val = match high {
-            b'0'..=b'9' => high - b'0',
-            b'a'..=b'f' => high - b'a' + 10,
-            _ => return Err(Error::InvalidHex),
-        };
-        let low_val = match low {
-            b'0'..=b'9' => low - b'0',
-            b'a'..=b'f' => low - b'a' + 10,
-            _ => return Err(Error::InvalidHex),
-        };
-        output[i] = (high_val << 4) | low_val;
+        let high = nibble_char_to_value(data[i * 2])?;
+        let low = nibble_char_to_value(data[i * 2 + 1])?;
+        output[i] = (high << 4) | low;
     }
     Ok(())
 }
