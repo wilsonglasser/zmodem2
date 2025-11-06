@@ -2,7 +2,7 @@
 // Copyright (c) 2017-2020 Alexey Arbuzov
 // Copyright (c) 2023-2025 Jarkko Sakkinen
 
-//! ZMODEM file transfer protocol crate. `zmodem2::receive` and `zmodem2::send`
+//! ZMODEM file transfer protocol crate. `zmodem2::State::receive` and `zmodem2::State::send`
 //! provide a synchronous and sequential API for sending and receiving files
 //! with the ZMODEM protocol. Each step corresponds to a single ZMODEM frame
 //! transaction, and the state between the calls is kept in a `zmodem2::State`
@@ -11,28 +11,37 @@
 //! The usage can be described in the high-level with the following flow:
 //!
 //! 1. Create `zmodem2::State`.
-//! 2. Call either `zmodem2::send` or `zmodem2::receive`.
+//! 2. Call either `state.send(...)` or `state.receive(...)`.
 //! 3. If the returned `zmodem2::Stage` is not yet `zmodem2::Stage::FileEnd`,
 //!    go back to step 2.
 
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
+#![allow(clippy::result_large_err)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 mod buffer;
 mod crc;
-mod hex;
+mod error;
+mod io;
 #[cfg(feature = "std")]
 mod std;
 mod zdle;
 
 pub use buffer::*;
+pub use error::*;
+pub use io::{Read, Seek, Write};
 
 use bitflags::bitflags;
-use core::{convert::TryFrom, str::FromStr};
-use heapless::String;
+use core::{
+    cmp::min,
+    convert::TryFrom,
+    fmt,
+    ops::{Deref, DerefMut},
+    str::FromStr,
+};
+use strum::EnumIter;
 use strum::IntoEnumIterator;
-use strum_macros::EnumIter;
 
 /// Size of the unescaped subpacket payload. The size is picked from the
 /// original ZMODEM specification.
@@ -47,6 +56,12 @@ const HEADER_SIZE: usize = 32;
 /// The number of subpackets to stream
 const SUBPACKET_PER_ACK: usize = 10;
 
+/// Maximum number of bytes to represent a u32 as ASCII.
+const U32_ASCII_MAX: usize = 10;
+
+/// The capacity of the fixed-size `String` type.
+const STRING_CAP: usize = 256;
+
 pub const ZPAD: u8 = b'*';
 pub const ZDLE: u8 = 0x18;
 pub const XON: u8 = 0x11;
@@ -59,79 +74,117 @@ const ZNAK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZNAK, &[0; 4]);
 const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, &[0; 4]);
 const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 4]);
 
-/// Error codes for `zmodem2::send` and `zmodem2::receive`
-#[derive(Debug, PartialEq)]
-pub enum Error {
-    /// Buffer or other compile-time set capacity exceeded
-    CapacityExceeded(usize),
-    /// The received data failed validation
-    Data,
-    /// The field for filename is missing in the ZFILE packet
-    FileNameMissing,
-    /// Filename in the ZFILE packet has zero length
-    FileNameEmpty,
-    /// Invalid hex string
-    InvalidHex,
-    /// I/O error during read
-    Read,
-    /// I/O error during write
-    Write,
-}
+/// A stack-allocated, fixed-capacity string.
+///
+/// This is a newtype wrapper around `Buffer<256>` to provide type safety and
+/// string-specific operations.
+#[derive(Eq)]
+pub struct String(Buffer<STRING_CAP>);
 
-/// Write I/O operations
-pub trait Write {
-    /// Attempts to write the entire buffer
-    ///
-    /// # Errors
-    ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    fn write_all(&mut self, buf: &[u8]) -> Result<(), Error>;
-
-    /// Attempts to write a single byte
-    ///
-    /// # Errors
-    ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    fn write_byte(&mut self, value: u8) -> Result<(), Error> {
-        self.write_all(&[value])
+impl Default for String {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Read I/O operations
-pub trait Read {
-    /// Reads some bytes to the buffeer
-    ///
-    /// # Errors
-    ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    fn read(&mut self, buf: &mut [u8]) -> Result<u32, Error>;
+impl From<&str> for String {
+    /// Creates a new `String` from a `&str`, truncating if necessary.
+    fn from(s: &str) -> Self {
+        let mut string = Self::new();
+        let bytes = s.as_bytes();
+        let len = min(bytes.len(), STRING_CAP);
+        let mut end = len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
 
-    /// Reads exactly one byte to the buffer
-    ///
-    /// # Errors
-    ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    fn read_byte(&mut self) -> Result<u8, Error>;
+        let truncated_bytes = &bytes[..end];
+        string
+            .extend_from_slice(truncated_bytes)
+            .unwrap_or_default();
+        string
+    }
 }
 
-/// Seek I/O operations
-pub trait Seek {
-    /// Seeks to an offset
+impl String {
+    /// Creates a new, empty string.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Buffer::<STRING_CAP>::new())
+    }
+
+    /// Resets buffer length back to zero.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Returns the capacity of the buffer in bytes.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Copies bytes from a slice to the end of the buffer.
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    fn seek(&mut self, offset: u32) -> Result<(), Error>;
+    /// Returns `Err(CapacityError)`, if the capacity would be exceeded.
+    pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), CapacityError> {
+        self.0.extend_from_slice(slice)
+    }
+}
+
+impl Deref for String {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for String {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for String {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl<T: ?Sized> PartialEq<T> for String
+where
+    T: AsRef<[u8]>,
+{
+    fn eq(&self, other: &T) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl fmt::Debug for String {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match core::str::from_utf8(&self.0) {
+            Ok(s) => f.write_str(s),
+            Err(_) => f.debug_list().entries(self.0.iter()).finish(),
+        }
+    }
+}
+
+impl fmt::Display for String {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&core::str::from_utf8(&self.0).unwrap_or(""))
+    }
+}
+
+/// A result type for polling-based operations.
+#[derive(Debug, PartialEq)]
+pub enum Poll {
+    /// The operation has completed a step.
+    Ready,
+    /// The operation is not yet complete as it would block.
+    Pending,
 }
 
 /// Data structure for holding a ZMODEM protocol header, which begins a frame,
@@ -180,6 +233,7 @@ impl Header {
     /// * `Err(Error::Read)` when the read I/O fails with the serial port
     /// * `Err(Error::Write)` when the write I/O fails with the serial port
     /// * `Err(Error::Data)` when corrupted data has been detected
+    /// * `Err(Error::WouldBlock)` when the I/O operation would block
     pub fn write<P>(&self, port: &mut P) -> Result<(), Error>
     where
         P: Write + ?Sized,
@@ -191,27 +245,27 @@ impl Header {
         }
         port.write_byte(ZDLE)?;
         port.write_byte(self.encoding as u8)?;
-        out.push(self.frame as u8)?;
-        out.extend_from_slice(&self.flags)?;
-        // Skips ZPAD and encoding:
+        out.push(self.frame as u8)
+            .map_err(|_| MarshalError::CapacityExceeded("Header::write", out.capacity()))?;
+        out.extend_from_slice(&self.flags)
+            .map_err(|_| MarshalError::CapacityExceeded("Header::write", out.capacity()))?;
         let mut crc = [0u8; 4];
         let crc_len = make_crc(&out, &mut crc, self.encoding);
-        out.extend_from_slice(&crc[..crc_len])?;
-        // Skips ZPAD and encoding:
+        out.extend_from_slice(&crc[..crc_len])
+            .map_err(|_| MarshalError::CapacityExceeded("Header::write", out.capacity()))?;
         if self.encoding == Encoding::ZHEX {
             let mut hex_buf = [0u8; HEADER_SIZE];
             let len = out.len() * 2;
-            if len > hex_buf.len() {
-                return Err(Error::Data);
-            }
-            let hex = &mut hex_buf[..len];
-            hex::encode(&out, hex)?;
-            out.clear();
-            out.extend_from_slice(hex)?;
+            let hex = &mut hex_buf
+                .get_mut(..len)
+                .ok_or(MarshalError::CapacityExceeded("Header::write", len))?;
+            hex::encode_to_slice(&out, hex)
+                .map_err(|_| MarshalError::CapacityExceeded("Header::write::hex", hex.len()))?;
+            write_slice_escaped(port, hex)?;
+        } else {
+            write_slice_escaped(port, &out)?;
         }
-        write_slice_escaped(port, &out)?;
         if self.encoding == Encoding::ZHEX {
-            // Add trailing CRLF for ZHEX transfer:
             port.write_byte(b'\r')?;
             port.write_byte(b'\n')?;
             if self.frame != Frame::ZACK && self.frame != Frame::ZFIN {
@@ -229,6 +283,7 @@ impl Header {
     /// * `Err(Error::Read)` when the read I/O fails with the serial port
     /// * `Err(Error::Write)` when the write I/O fails with the serial port
     /// * `Err(Error::Data)` when corrupted data has been detected
+    /// * `Err(Error::WouldBlock)` when the I/O operation would block
     pub fn read<P>(port: &mut P) -> Result<Header, Error>
     where
         P: Read + ?Sized,
@@ -236,16 +291,21 @@ impl Header {
         let encoding = Encoding::try_from(port.read_byte()?)?;
         let mut out_hex: Buffer<HEADER_SIZE> = Buffer::new();
         for _ in 0..Header::unescaped_size(encoding) - 1 {
-            out_hex.push(read_byte_unescaped(port)?)?;
+            out_hex.push(read_byte_unescaped(port)?).map_err(|_| {
+                UnmarshalError::CapacityExceeded("Header::read", out_hex.capacity())
+            })?;
         }
         let mut out: Buffer<HEADER_SIZE> = Buffer::new();
         if encoding == Encoding::ZHEX {
             let mut out_bytes = [0u8; HEADER_SIZE / 2];
             let out_len = out_hex.len() / 2;
-            hex::decode(&out_hex, &mut out_bytes[..out_len])?;
-            out.extend_from_slice(&out_bytes[..out_len])?;
+            hex::decode_to_slice(&out_hex, &mut out_bytes[..out_len])
+                .map_err(|_| UnmarshalError::MalformedHeader)?;
+            out.extend_from_slice(&out_bytes[..out_len])
+                .map_err(|_| UnmarshalError::CapacityExceeded("Header::read", out.capacity()))?;
         } else {
-            out.extend_from_slice(&out_hex)?;
+            out.extend_from_slice(&out_hex)
+                .map_err(|_| UnmarshalError::CapacityExceeded("Header::read", out.capacity()))?;
         }
         check_crc(&out[..5], &out[5..], encoding)?;
         let frame = Frame::try_from(out[0])?;
@@ -266,8 +326,6 @@ impl Header {
         match encoding {
             Encoding::ZBIN => core::mem::size_of::<Header>() + 2,
             Encoding::ZBIN32 => core::mem::size_of::<Header>() + 4,
-            // Encoding is stored as a single byte also for ZHEX, thus the
-            // subtraction:
             Encoding::ZHEX => (core::mem::size_of::<Header>() + 2) * 2 - 1,
         }
     }
@@ -289,7 +347,7 @@ impl TryFrom<u8> for Encoding {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Encoding::iter()
             .find(|e| value == *e as u8)
-            .ok_or(Error::Data)
+            .ok_or(Error::Unmarshal(UnmarshalError::MalformedEncoding(value)))
     }
 }
 
@@ -344,7 +402,9 @@ impl TryFrom<u8> for Frame {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Frame::iter().find(|t| value == *t as u8).ok_or(Error::Data)
+        Frame::iter()
+            .find(|t| value == *t as u8)
+            .ok_or(Error::Unmarshal(UnmarshalError::MalformedFrame(value)))
     }
 }
 
@@ -387,7 +447,7 @@ impl TryFrom<u8> for Packet {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Packet::iter()
             .find(|e| value == *e as u8)
-            .ok_or(Error::Data)
+            .ok_or(Error::Unmarshal(UnmarshalError::MalformedPacket(value)))
     }
 }
 
@@ -395,7 +455,7 @@ impl TryFrom<u8> for Packet {
 pub struct State {
     stage: Stage,
     count: u32,
-    file_name: String<256>,
+    file_name: String,
     file_size: u32,
     buf: Buffer<SUBPACKET_CRC_MAX_SIZE>,
 }
@@ -419,22 +479,42 @@ impl State {
         }
     }
 
-    /// Create a new transmission context with file name and size
+    /// Create a new transmission context for the first file in a batch.
     ///
     /// # Errors
     ///
     /// * `Err(Error::Read)` when the read I/O fails with the serial port
     /// * `Err(Error::Write)` when the write I/O fails with the serial port
     /// * `Err(Error::Data)` when corrupted data has been detected
-    pub fn new_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
-        let file_name = String::from_str(file_name).or(Err(Error::Data))?;
-        Ok(Self {
-            stage: Stage::SessionBegin,
-            count: 0,
-            file_name,
-            file_size,
-            buf: Buffer::<SUBPACKET_CRC_MAX_SIZE>::new(),
-        })
+    /// * `Err(Error::WouldBlock)` when the I/O operation would block
+    pub fn set_first_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
+        let mut state = Self::new();
+        state
+            .file_name
+            .extend_from_slice(file_name.as_bytes())
+            .map_err(|_| {
+                MarshalError::CapacityExceeded("State::file_name", state.file_name.capacity())
+            })?;
+        state.file_size = file_size;
+        Ok(state)
+    }
+
+    /// Prepares the state for the next file in a batch transfer.
+    ///
+    /// # Errors
+    ///
+    /// * `Err(Error::Data)` when the `file_name` is invalid.
+    pub fn set_next_file(&mut self, file_name: &str, file_size: u32) -> Result<(), Error> {
+        self.file_name.clear();
+        self.file_name
+            .extend_from_slice(file_name.as_bytes())
+            .map_err(|_| {
+                MarshalError::CapacityExceeded("State::file_name", self.file_name.capacity())
+            })?;
+        self.file_size = file_size;
+        self.count = 0;
+        self.stage = Stage::FileEnd;
+        Ok(())
     }
 
     #[must_use]
@@ -448,13 +528,223 @@ impl State {
     }
 
     #[must_use]
-    pub fn file_name(&self) -> &str {
+    pub fn file_name(&self) -> &[u8] {
         &self.file_name
     }
 
     #[must_use]
     pub fn file_size(&self) -> u32 {
         self.file_size
+    }
+
+    /// Sends a file using the ZMODEM file transfer protocol.
+    ///
+    /// # Errors
+    ///
+    /// * `Err(Error::Read)` when the read I/O fails with the serial port
+    /// * `Err(Error::Write)` when the write I/O fails with the serial port
+    /// * `Err(Error::Data)` when corrupted data has been detected
+    pub fn send<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Poll, Error>
+    where
+        P: Read + Write + ?Sized,
+        F: Read + Seek + ?Sized,
+    {
+        match self.send_impl(port, file) {
+            Ok(()) => Ok(Poll::Ready),
+            Err(Error::Io(IoError::WouldBlock)) => Ok(Poll::Pending),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn send_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<(), Error>
+    where
+        P: Read + Write + ?Sized,
+        F: Read + Seek + ?Sized,
+    {
+        if self.stage == Stage::SessionBegin {
+            ZRQINIT_HEADER.write(port)?;
+        } else if self.stage == Stage::FileEnd {
+            write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?;
+            self.stage = Stage::FileBegin;
+            return Ok(());
+        }
+
+        match read_zpad(port) {
+            Ok(()) => (),
+            Err(Error::Unmarshal(_)) => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+
+        let Ok(header) = Header::read(port) else {
+            ZNAK_HEADER.write(port)?;
+            return Ok(());
+        };
+
+        match header.frame() {
+            Frame::ZRINIT => {
+                if self.stage == Stage::SessionBegin {
+                    write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?;
+                    self.stage = Stage::FileBegin;
+                } else if self.stage == Stage::FileInProgress {
+                    self.stage = Stage::FileEnd;
+                }
+            }
+            Frame::ZRPOS | Frame::ZACK => {
+                if self.stage == Stage::SessionBegin {
+                    ZRQINIT_HEADER.write(port)?;
+                } else if self.stage == Stage::FileBegin || self.stage == Stage::FileInProgress {
+                    write_zdata(port, file, header.count())?;
+                    self.stage = Stage::FileInProgress;
+                }
+            }
+            _ => {
+                if self.stage == Stage::SessionBegin {
+                    ZRQINIT_HEADER.write(port)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Receives a file using the ZMODEM file transfer protocol.
+    ///
+    /// # Errors
+    ///
+    /// * `Err(Error::Read)` when the read I/O fails with the serial port
+    /// * `Err(Error::Write)` when the write I/O fails with the serial port
+    /// * `Err(Error::Data)` when corrupted data has been detected
+    pub fn receive<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Poll, Error>
+    where
+        P: Read + Write + ?Sized,
+        F: Write + ?Sized,
+    {
+        match self.receive_impl(port, file) {
+            Ok(()) => Ok(Poll::Ready),
+            Err(Error::Io(IoError::WouldBlock)) => Ok(Poll::Pending),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn receive_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<(), Error>
+    where
+        P: Read + Write + ?Sized,
+        F: Write + ?Sized,
+    {
+        if self.stage == Stage::SessionBegin {
+            write_zrinit(port)?;
+        }
+        match read_zpad(port) {
+            Ok(()) => { /* ZPAD detected, continue to read header */ }
+            Err(Error::Io(IoError::WouldBlock)) => return Err(Error::Io(IoError::WouldBlock)),
+            Err(Error::Io(IoError::Read(err))) => {
+                if self.stage == Stage::FileBegin {
+                    self.stage = Stage::SessionEnd;
+                    return Ok(());
+                }
+                return Err(IoError::Read(err).into());
+            }
+            Err(e) => return Err(e),
+        }
+
+        let header = match Header::read(port) {
+            Ok(header) => header,
+            Err(Error::Io(IoError::Read(err))) => {
+                if self.stage == Stage::FileBegin {
+                    self.stage = Stage::SessionEnd;
+                    return Ok(());
+                }
+                return Err(IoError::Read(err).into());
+            }
+            Err(Error::Unmarshal(_)) => {
+                ZNAK_HEADER.write(port)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        match header.frame() {
+            Frame::ZFILE => {
+                if self.stage == Stage::SessionBegin || self.stage == Stage::FileBegin {
+                    read_zfile(port, self, header.encoding())?;
+                    self.stage = Stage::FileBegin;
+                }
+            }
+            Frame::ZDATA => {
+                if self.stage == Stage::SessionBegin {
+                    write_zrinit(port)?;
+                } else if self.stage == Stage::FileBegin || self.stage == Stage::FileInProgress {
+                    if header.count() != self.count {
+                        ZRPOS_HEADER.with_count(self.count).write(port)?;
+                        return Ok(());
+                    }
+                    read_zdata(port, self, header.encoding(), file)?;
+                    self.stage = Stage::FileInProgress;
+                }
+            }
+            Frame::ZEOF => {
+                if self.stage == Stage::FileInProgress && header.count() == self.count {
+                    write_zrinit(port)?;
+                    self.stage = Stage::FileBegin;
+                }
+            }
+            Frame::ZFIN => {
+                if self.stage == Stage::FileInProgress || self.stage == Stage::FileBegin {
+                    ZFIN_HEADER.write(port)?;
+                    self.stage = Stage::SessionEnd;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Send ZFIN.
+    ///
+    /// # Errors
+    ///
+    /// * `Err(Error::Read)` when the read I/O fails with the serial port
+    /// * `Err(Error::Write)` when the write I/O fails with the serial port
+    /// * `Err(Error::Data)` when corrupted data has been detected
+    pub fn finish<P>(&mut self, port: &mut P) -> Result<Poll, Error>
+    where
+        P: Read + Write + ?Sized,
+    {
+        match self.finish_impl(port) {
+            Ok(()) => Ok(Poll::Ready),
+            Err(Error::Io(IoError::WouldBlock)) => Ok(Poll::Pending),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn finish_impl<P>(&mut self, port: &mut P) -> Result<(), Error>
+    where
+        P: Read + Write + ?Sized,
+    {
+        ZFIN_HEADER.write(port)?;
+
+        if read_zpad(port).is_err() {
+            return Ok(());
+        }
+
+        let Ok(frame) = Header::read(port) else {
+            ZNAK_HEADER.write(port)?;
+            return Ok(());
+        };
+
+        match frame.frame() {
+            Frame::ZFIN | Frame::ZRINIT => {
+                port.write_byte(b'O')?;
+                port.write_byte(b'O')?;
+                self.stage = Stage::SessionEnd;
+            }
+            _ => {
+                ZFIN_HEADER.write(port)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -467,155 +757,6 @@ pub enum Stage {
     SessionEnd,
 }
 
-/// Sends a file using the ZMODEM file transfer protocol.
-///
-/// # Errors
-///
-/// * `Err(Error::Read)` when the read I/O fails with the serial port
-/// * `Err(Error::Write)` when the write I/O fails with the serial port
-/// * `Err(Error::Data)` when corrupted data has been detected
-pub fn send<P, F>(port: &mut P, file: &mut F, state: &mut State) -> Result<(), Error>
-where
-    P: Read + Write + ?Sized,
-    F: Read + Seek + ?Sized,
-{
-    if state.stage == Stage::SessionBegin {
-        ZRQINIT_HEADER.write(port)?;
-    }
-
-    match read_zpad(port) {
-        Ok(()) => (),
-        Err(Error::Data) => {
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    }
-
-    let Ok(header) = Header::read(port) else {
-        ZNAK_HEADER.write(port)?;
-        return Ok(());
-    };
-
-    match header.frame() {
-        Frame::ZRINIT => {
-            if state.stage == Stage::SessionBegin {
-                write_zfile(port, &mut state.buf, &state.file_name, state.file_size)?;
-                state.stage = Stage::FileBegin;
-            } else if state.stage == Stage::FileInProgress {
-                state.stage = Stage::FileEnd;
-            }
-        }
-        Frame::ZRPOS | Frame::ZACK => {
-            if state.stage == Stage::SessionBegin {
-                ZRQINIT_HEADER.write(port)?;
-            } else if state.stage == Stage::FileBegin || state.stage == Stage::FileInProgress {
-                write_zdata(port, file, header.count())?;
-                state.stage = Stage::FileInProgress;
-            }
-        }
-        _ => {
-            if state.stage == Stage::SessionBegin {
-                ZRQINIT_HEADER.write(port)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Receives a file using the ZMODEM file transfer protocol.
-///
-/// # Errors
-///
-/// * `Err(Error::Read)` when the read I/O fails with the serial port
-/// * `Err(Error::Write)` when the write I/O fails with the serial port
-/// * `Err(Error::Data)` when corrupted data has been detected
-pub fn receive<P, F>(port: &mut P, file: &mut F, state: &mut State) -> Result<(), Error>
-where
-    P: Read + Write + ?Sized,
-    F: Write + ?Sized,
-{
-    if state.stage == Stage::SessionBegin {
-        write_zrinit(port)?;
-    }
-    if read_zpad(port).is_err() {
-        return Ok(());
-    }
-    let Ok(header) = Header::read(port) else {
-        ZNAK_HEADER.write(port)?;
-        return Ok(());
-    };
-    match header.frame() {
-        Frame::ZFILE => {
-            if state.stage == Stage::SessionBegin || state.stage == Stage::FileBegin {
-                read_zfile(port, state, header.encoding())?;
-                state.stage = Stage::FileBegin;
-            }
-        }
-        Frame::ZDATA => {
-            if state.stage == Stage::SessionBegin {
-                write_zrinit(port)?;
-            } else if state.stage == Stage::FileBegin || state.stage == Stage::FileInProgress {
-                if header.count() != state.count {
-                    ZRPOS_HEADER.with_count(state.count).write(port)?;
-                    return Ok(());
-                }
-                read_zdata(port, state, header.encoding(), file)?;
-                state.stage = Stage::FileInProgress;
-            }
-        }
-        Frame::ZEOF => {
-            if state.stage == Stage::FileInProgress && header.count() == state.count {
-                write_zrinit(port)?;
-                state.stage = Stage::FileBegin;
-            }
-        }
-        Frame::ZFIN => {
-            if state.stage == Stage::FileInProgress || state.stage == Stage::FileBegin {
-                ZFIN_HEADER.write(port)?;
-                state.stage = Stage::SessionEnd;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Send ZFIN.
-///
-/// # Errors
-///
-/// * `Err(Error::Read)` when the read I/O fails with the serial port
-/// * `Err(Error::Write)` when the write I/O fails with the serial port
-/// * `Err(Error::Data)` when corrupted data has been detected
-pub fn finish<P>(port: &mut P, state: &mut State) -> Result<(), Error>
-where
-    P: Read + Write + ?Sized,
-{
-    ZFIN_HEADER.write(port)?;
-
-    if read_zpad(port).is_err() {
-        return Ok(());
-    }
-
-    let Ok(frame) = Header::read(port) else {
-        ZNAK_HEADER.write(port)?;
-        return Ok(());
-    };
-
-    match frame.frame() {
-        Frame::ZFIN => {
-            port.write_byte(b'O')?;
-            port.write_byte(b'O')?;
-            state.stage = Stage::SessionEnd;
-        }
-        _ => {
-            ZFIN_HEADER.write(port)?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Writes ZRINIT
 fn write_zrinit<P>(port: &mut P) -> Result<(), Error>
 where
@@ -625,22 +766,51 @@ where
     Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0, 0, 0, zrinit.bits()]).write(port)
 }
 
+/// Converts a u32 to its ASCII byte representation.
+///
+/// This function writes the ASCII digits of `value` into `buf` from right to
+/// left and returns a slice pointing to the written digits.
+///
+/// Example: `value = 123`, `buf = [0u8; 10]`
+/// -> `buf` becomes `[..., 0, 0, 0, 0, 1, 2, 3]`
+/// -> returns `&[1, 2, 3]`
+fn u32_to_ascii_bytes(mut value: u32, buf: &mut [u8; U32_ASCII_MAX]) -> &[u8] {
+    if value == 0 {
+        buf[U32_ASCII_MAX - 1] = b'0';
+        return &buf[U32_ASCII_MAX - 1..];
+    }
+
+    let mut index = U32_ASCII_MAX;
+    while value > 0 {
+        index -= 1;
+        buf[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    &buf[index..]
+}
+
 /// Write ZRFILE
 fn write_zfile<P>(
     port: &mut P,
     buf: &mut Buffer<SUBPACKET_CRC_MAX_SIZE>,
-    name: &str,
+    name: &[u8],
     size: u32,
 ) -> Result<(), Error>
 where
     P: Write + ?Sized,
 {
-    let size = String::<17>::try_from(size).or(Err(Error::Data))?;
+    let mut size_buf = [0u8; U32_ASCII_MAX];
+    let size_bytes = u32_to_ascii_bytes(size, &mut size_buf);
+
     buf.clear();
-    buf.extend_from_slice(name.as_bytes())?;
-    buf.push(b'\0')?;
-    buf.extend_from_slice(size.as_ref())?;
-    buf.push(b'\0')?;
+    buf.extend_from_slice(name)
+        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::name", buf.capacity()))?;
+    buf.push(b'\0')
+        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::nul", buf.capacity()))?;
+    buf.extend_from_slice(size_bytes)
+        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::size", buf.capacity()))?;
+    buf.push(b'\0')
+        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::nul", buf.capacity()))?;
     Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4]).write(port)?;
     write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, buf)
 }
@@ -653,26 +823,50 @@ where
 {
     match read_subpacket(port, &mut state.buf, encoding) {
         Ok(_) => {
-            let payload = core::str::from_utf8(&state.buf).map_err(|_| Error::Data)?;
-            let mut fields = payload.split('\0');
+            let payload = &state.buf;
+            let mut fields = payload.split(|&b| b == b'\0');
 
-            let file_name = fields.next().ok_or(Error::FileNameMissing)?;
-            if file_name.is_empty() {
-                return Err(Error::FileNameEmpty);
+            let file_name_bytes = fields.next().ok_or(UnmarshalError::MalformedFileName)?;
+            if file_name_bytes.is_empty() {
+                return Err(UnmarshalError::MalformedFileName.into());
             }
-            state.file_name = String::from_str(file_name).map_err(|()| Error::Data)?;
 
-            if let Some(size_str) = fields.next() {
-                if let Some(field) = size_str.split_ascii_whitespace().next() {
-                    state.file_size = u32::from_str(field).map_err(|_| Error::Data)?;
+            core::str::from_utf8(file_name_bytes).map_err(|_| UnmarshalError::MalformedFileName)?;
+
+            state.file_name.clear();
+            state
+                .file_name
+                .extend_from_slice(file_name_bytes)
+                .map_err(|_| {
+                    UnmarshalError::CapacityExceeded("read_zfile::name", state.file_name.capacity())
+                })?;
+
+            if let Some(size_str_bytes) = fields.next() {
+                let size_field_bytes = size_str_bytes
+                    .split(|&b| b == b' ')
+                    .next()
+                    .unwrap_or_default();
+
+                if size_field_bytes.is_empty() {
+                    state.file_size = 0;
+                } else {
+                    let size_str = core::str::from_utf8(size_field_bytes)
+                        .map_err(|_| UnmarshalError::MalformedFileSize)?;
+                    state.file_size =
+                        u32::from_str(size_str).map_err(|_| UnmarshalError::MalformedFileSize)?;
                 }
+            } else {
+                state.file_size = 0;
             }
 
             state.count = 0;
 
             ZRPOS_HEADER.with_count(0).write(port)
         }
-        _ => ZNAK_HEADER.write(port).map_err(|_| Error::Data),
+        Err(e) => {
+            ZNAK_HEADER.write(port)?;
+            Err(e)
+        }
     }
 }
 
@@ -684,8 +878,13 @@ where
 {
     let mut offset = offset;
     let mut local_buf = [0u8; SUBPACKET_MAX_SIZE];
-    let read_buf = &mut local_buf[..SUBPACKET_MAX_SIZE - 2];
-    file.seek(offset)?;
+    let read_buf = &mut local_buf[..SUBPACKET_MAX_SIZE];
+
+    let new_offset = file.seek(offset)?;
+    if new_offset != offset {
+        return Err(MarshalError::FileTruncated.into());
+    }
+
     let mut count = file.read(read_buf)? as usize;
     if count == 0 {
         ZEOF_HEADER.with_count(offset).write(port)?;
@@ -694,7 +893,9 @@ where
     ZDATA_HEADER.with_count(offset).write(port)?;
     for _ in 1..SUBPACKET_PER_ACK {
         write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCG, &read_buf[..count])?;
-        offset += u32::try_from(count).map_err(|_| Error::Data)?;
+        offset += u32::try_from(count).map_err(|_| {
+            Error::Marshal(MarshalError::CapacityExceeded("write_zdata::offset", count))
+        })?;
         count = file.read(read_buf)? as usize;
         if count < read_buf.len() {
             break;
@@ -717,14 +918,19 @@ where
     loop {
         let zcrc = match read_subpacket(port, &mut state.buf, encoding) {
             Ok(zcrc) => zcrc,
-            Err(Error::Data) => {
+            Err(Error::Unmarshal(_)) => {
                 ZNAK_HEADER.with_count(state.count).write(port)?;
                 continue;
             }
             Err(err) => return Err(err),
         };
         file.write_all(&state.buf)?;
-        state.count += u32::try_from(state.buf.len()).map_err(|_| Error::Data)?;
+        state.count += u32::try_from(state.buf.len()).map_err(|_| {
+            Error::Marshal(MarshalError::CapacityExceeded(
+                "read_zdata::count",
+                state.buf.len(),
+            ))
+        })?;
         match zcrc {
             Packet::ZCRCW => {
                 ZACK_HEADER.with_count(state.count).write(port)?;
@@ -747,24 +953,26 @@ where
 ///
 /// Returns `Error::Data` if the sequence is malformed or `Error::Read` on an
 /// I/O error.
-pub fn read_zpad<P>(port: &mut P) -> Result<(), Error>
+fn read_zpad<P>(port: &mut P) -> Result<(), Error>
 where
     P: Read + ?Sized,
 {
-    if port.read_byte()? != ZPAD {
-        return Err(Error::Data);
-    }
+    loop {
+        loop {
+            if port.read_byte()? == ZPAD {
+                break;
+            }
+        }
 
-    let mut b = port.read_byte()?;
-    if b == ZPAD {
-        b = port.read_byte()?;
-    }
+        let mut b = port.read_byte()?;
+        if b == ZPAD {
+            b = port.read_byte()?;
+        }
 
-    if b == ZDLE {
-        return Ok(());
+        if b == ZDLE {
+            return Ok(());
+        }
     }
-
-    Err(Error::Data)
 }
 
 /// Reads and unescapes a ZMODEM protocol subpacket.
@@ -777,7 +985,7 @@ where
 ///
 /// The function will panic if the buffer is somehow empty when attempting to
 /// pop the CRC byte, which should not happen in a valid transmission.
-pub fn read_subpacket<P>(
+fn read_subpacket<P>(
     port: &mut P,
     buf: &mut Buffer<SUBPACKET_CRC_MAX_SIZE>,
     encoding: Encoding,
@@ -791,12 +999,16 @@ where
         if byte == ZDLE {
             let byte = port.read_byte()?;
             if let Ok(packet) = Packet::try_from(byte) {
-                buf.push(packet as u8)?;
+                buf.push(packet as u8).map_err(|_| {
+                    UnmarshalError::CapacityExceeded("read_subpacket", buf.capacity())
+                })?;
                 break packet;
             }
-            buf.push(zdle::UNZDLE_TABLE[byte as usize])?;
+            buf.push(zdle::UNZDLE_TABLE[byte as usize])
+                .map_err(|_| UnmarshalError::CapacityExceeded("read_subpacket", buf.capacity()))?;
         } else {
-            buf.push(byte)?;
+            buf.push(byte)
+                .map_err(|_| UnmarshalError::CapacityExceeded("read_subpacket", buf.capacity()))?;
         }
 
         if buf.len() == buf.capacity() {
@@ -813,8 +1025,8 @@ where
     }
     check_crc(buf, &crc[..crc_len], encoding)?;
 
-    // Pop ZCRC
-    buf.pop().unwrap();
+    buf.pop()
+        .ok_or(Error::Unmarshal(UnmarshalError::MalformedHeader))?;
     Ok(result)
 }
 
@@ -847,7 +1059,7 @@ where
 ///
 /// This function returns `Error::Write` on an I/O error or `Error::Data` on
 /// a data validation error.
-pub fn write_subpacket<P>(
+fn write_subpacket<P>(
     port: &mut P,
     encoding: Encoding,
     kind: Packet,
@@ -863,8 +1075,12 @@ where
     match encoding {
         Encoding::ZBIN32 => {
             let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
-            crc_buf.extend_from_slice(data)?;
-            crc_buf.push(kind)?;
+            crc_buf.extend_from_slice(data).map_err(|_| {
+                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
+            })?;
+            crc_buf.push(kind).map_err(|_| {
+                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
+            })?;
 
             let mut buf = [0u8; 4];
             let crc = crc::crc32_iso_hdlc(&crc_buf).to_le_bytes();
@@ -873,8 +1089,12 @@ where
         }
         Encoding::ZBIN => {
             let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
-            crc_buf.extend_from_slice(data)?;
-            crc_buf.push(kind)?;
+            crc_buf.extend_from_slice(data).map_err(|_| {
+                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
+            })?;
+            crc_buf.push(kind).map_err(|_| {
+                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
+            })?;
 
             let mut buf = [0u8; 2];
             let crc = crc::crc16_xmodem(&crc_buf).to_be_bytes();
@@ -892,8 +1112,10 @@ fn check_crc(data: &[u8], crc: &[u8], encoding: Encoding) -> Result<(), Error> {
     let crc2_len = make_crc(data, &mut crc2, encoding);
     if *crc == crc2[..crc2_len] {
         Ok(())
+    } else if encoding == Encoding::ZBIN32 {
+        Err(UnmarshalError::Crc32Mismatch.into())
     } else {
-        Err(Error::Data)
+        Err(UnmarshalError::Crc16Mismatch.into())
     }
 }
 

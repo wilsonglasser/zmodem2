@@ -4,10 +4,7 @@
 
 use core::cmp;
 use rstest::rstest;
-use zmodem2::{
-    read_subpacket, read_zpad, receive, write_subpacket, Buffer, Encoding, Error, Frame, Header,
-    Packet, Read, State, Write, XON, ZDLE, ZPAD,
-};
+use zmodem2::{Encoding, Error, Frame, Header, IoError, Poll, Read, State, Write, XON, ZDLE, ZPAD};
 
 struct MockPort<'a> {
     input: &'a [u8],
@@ -25,6 +22,9 @@ impl<'a> MockPort<'a> {
 
 impl<'a> Read for MockPort<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<u32, Error> {
+        if self.input.is_empty() {
+            return Err(IoError::WouldBlock.into());
+        }
         let n = cmp::min(self.input.len(), buf.len());
         buf[..n].copy_from_slice(&self.input[..n]);
         self.input = &self.input[n..];
@@ -36,7 +36,7 @@ impl<'a> Read for MockPort<'a> {
             self.input = rest;
             Ok(first)
         } else {
-            Err(Error::Read)
+            Err(IoError::WouldBlock.into())
         }
     }
 }
@@ -86,42 +86,12 @@ pub fn test_header_read(
     assert!(Header::read(port) == Ok(Header::new(encoding, frame, flags)));
 }
 
-#[rstest]
-#[case(Encoding::ZBIN, Packet::ZCRCE, &[])]
-#[case(Encoding::ZBIN, Packet::ZCRCW, &[0x00])]
-#[case(Encoding::ZBIN32, Packet::ZCRCQ, &[0, 1, 2, 3, 4, 0x60, 0x60])]
-pub fn test_subpacket_read_write(
-    #[case] encoding: Encoding,
-    #[case] packet: Packet,
-    #[case] data: &[u8],
-) {
-    let mut buf = Buffer::new();
-    let mut port = vec![];
-    assert!(write_subpacket(&mut port, encoding, packet, data) == Ok(()));
-    buf.clear();
-    assert!(read_subpacket(&mut port.as_slice(), &mut buf, encoding) == Ok(packet));
-    assert!(buf == data);
-}
-
-#[rstest]
-#[case(&[ZPAD, ZDLE], Ok(()))]
-#[case(&[ZPAD, ZPAD, ZDLE], Ok(()))]
-#[case(&[ZDLE], Err(Error::Data))]
-#[case(&[ZPAD, XON], Err(Error::Data))]
-#[case(&[ZPAD, ZPAD, XON], Err(Error::Data))]
-#[case(&[], Err(Error::Read))]
-#[case(&[0; 100], Err(Error::Data))]
-pub fn test_zpad_read(#[case] port: &[u8], #[case] expected: Result<(), Error>) {
-    assert!(read_zpad(&mut port.to_vec().as_slice()) == expected);
-}
-
 #[test]
 fn test_receive_malformed_header() {
     let mut mock_port = MockPort::new(b"malformed data");
     let mut file = vec![];
     let mut state = State::new();
 
-    let result = receive(&mut mock_port, &mut file, &mut state);
-
-    assert!(result.is_ok());
+    let result = state.receive(&mut mock_port, &mut file);
+    assert!(matches!(result, Ok(Poll::Pending)));
 }

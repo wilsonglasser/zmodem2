@@ -6,6 +6,10 @@
 
 use core::ops::{Deref, DerefMut};
 
+/// An error indicating a buffer's capacity was exceeded.
+#[derive(Debug, PartialEq)]
+pub struct CapacityError;
+
 /// A buffer type for incoming and outgoing and other flyaway data.
 pub struct Buffer<const CAP: usize> {
     bytes: [u8; CAP],
@@ -55,15 +59,14 @@ impl<const CAP: usize> Buffer<CAP> {
     ///
     /// # Errors
     ///
-    /// Returns `Err(Error::CapacityExceeded)`, if the capacity would be
-    /// exceeded when the operation was let pass.
-    pub fn push(&mut self, value: u8) -> Result<(), crate::Error> {
+    /// Returns `Err(CapacityError)`, if the capacity would be exceeded.
+    pub fn push(&mut self, value: u8) -> Result<(), CapacityError> {
         if self.len < CAP {
             self.bytes[self.len] = value;
             self.len += 1;
             Ok(())
         } else {
-            Err(crate::Error::CapacityExceeded(CAP))
+            Err(CapacityError)
         }
     }
 
@@ -82,11 +85,10 @@ impl<const CAP: usize> Buffer<CAP> {
     ///
     /// # Errors
     ///
-    /// Returns `Err(Error::CapacityExceeded)`, if the capacity would be
-    /// exceeded when the operation was let pass.
-    pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), crate::Error> {
+    /// Returns `Err(CapacityError)`, if the capacity would be exceeded.
+    pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), CapacityError> {
         if self.len + slice.len() > CAP {
-            return Err(crate::Error::CapacityExceeded(CAP));
+            return Err(CapacityError);
         }
         let end = self.len + slice.len();
         self.bytes[self.len..end].copy_from_slice(slice);
