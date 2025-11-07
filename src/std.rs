@@ -9,14 +9,17 @@ impl<W> Write for W
 where
     W: std::io::Write,
 {
-    fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
-        std::io::Write::write_all(self, buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                Error::WouldBlock
-            } else {
-                Error::Write(String::from(e.to_string().as_str()))
+    fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error> {
+        match std::io::Write::write_all(self, buf) {
+            Ok(()) => Ok(Some(())),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(Error::Write(String::from(e.to_string().as_str())))
+                }
             }
-        })
+        }
     }
 }
 
@@ -24,29 +27,34 @@ impl<R> Read for R
 where
     R: std::io::Read,
 {
-    fn read(&mut self, buf: &mut [u8]) -> Result<u32, Error> {
-        let bytes_read = std::io::Read::read(self, buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                Error::WouldBlock
-            } else {
-                Error::Read(String::from(e.to_string().as_str()))
-            }
-        })?;
-        u32::try_from(bytes_read).map_err(|_| Error::OutOfMemory)
-    }
-
-    fn read_byte(&mut self) -> Result<u8, Error> {
-        let mut buf = [0; 1];
-        match std::io::Read::read(self, &mut buf) {
-            Ok(1) => Ok(buf[0]),
+    fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error> {
+        match std::io::Read::read(self, buf) {
+            Ok(bytes_read) => u32::try_from(bytes_read)
+                .map(Some)
+                .map_err(|_| Error::OutOfMemory),
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                    Err(Error::WouldBlock)
+                    Ok(None)
                 } else {
                     Err(Error::Read(String::from(e.to_string().as_str())))
                 }
             }
-            Ok(_) => Err(Error::NotConnected),
+        }
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>, Error> {
+        let mut buf = [0; 1];
+        match std::io::Read::read(self, &mut buf) {
+            Ok(1) => Ok(Some(buf[0])),
+            Ok(0) => Err(Error::UnexpectedEof),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(Error::Read(String::from(e.to_string().as_str())))
+                }
+            }
+            Ok(_) => Err(Error::Read(String::from("unknown read error"))),
         }
     }
 }
@@ -55,16 +63,20 @@ impl<S> Seek for S
 where
     S: std::io::Seek,
 {
-    fn seek(&mut self, offset: u32) -> Result<u32, Error> {
+    fn seek(&mut self, offset: u32) -> Result<Option<u32>, Error> {
         let new_offset = u64::from(offset);
-        let final_offset = std::io::Seek::seek(self, SeekFrom::Start(new_offset)).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                Error::WouldBlock
-            } else {
-                Error::Read(String::from(e.to_string().as_str()))
+        match std::io::Seek::seek(self, SeekFrom::Start(new_offset)) {
+            Ok(final_offset) => u32::try_from(final_offset)
+                .map(Some)
+                .map_err(|_| Error::UnexpectedEof),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(Error::Read(String::from(e.to_string().as_str())))
+                }
             }
-        })?;
-        u32::try_from(final_offset).map_err(|_| Error::UnexpectedEof)
+        }
     }
 }
 

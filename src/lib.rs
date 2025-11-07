@@ -220,18 +220,25 @@ impl Header {
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block
-    pub fn write<P>(&self, port: &mut P) -> Result<(), Error>
+    pub fn write<P>(&self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Write + ?Sized,
     {
         let mut out: Buffer<HEADER_SIZE> = Buffer::new();
-        port.write_byte(ZPAD)?;
-        if self.encoding == Encoding::ZHEX {
-            port.write_byte(ZPAD)?;
+
+        if port.write_byte(ZPAD)?.is_none() {
+            return Ok(None);
         }
-        port.write_byte(ZDLE)?;
-        port.write_byte(self.encoding as u8)?;
+        if self.encoding == Encoding::ZHEX && port.write_byte(ZPAD)?.is_none() {
+            return Ok(None);
+        }
+        if port.write_byte(ZDLE)?.is_none() {
+            return Ok(None);
+        }
+        if port.write_byte(self.encoding as u8)?.is_none() {
+            return Ok(None);
+        }
+
         out.push(self.frame as u8).map_err(|_| Error::OutOfMemory)?;
         out.extend_from_slice(&self.flags)
             .map_err(|_| Error::OutOfMemory)?;
@@ -239,23 +246,34 @@ impl Header {
         let crc_len = make_crc(&out, &mut crc, self.encoding);
         out.extend_from_slice(&crc[..crc_len])
             .map_err(|_| Error::OutOfMemory)?;
+
         if self.encoding == Encoding::ZHEX {
             let mut hex_buf = [0u8; HEADER_SIZE];
             let len = out.len() * 2;
             let hex = &mut hex_buf.get_mut(..len).ok_or(Error::UnexpectedEof)?;
             hex::encode_to_slice(&out, hex).map_err(|_| Error::OutOfMemory)?;
-            write_slice_escaped(port, hex)?;
-        } else {
-            write_slice_escaped(port, &out)?;
+            if write_slice_escaped(port, hex)?.is_none() {
+                return Ok(None);
+            }
+        } else if write_slice_escaped(port, &out)?.is_none() {
+            return Ok(None);
         }
+
         if self.encoding == Encoding::ZHEX {
-            port.write_byte(b'\r')?;
-            port.write_byte(b'\n')?;
-            if self.frame != Frame::ZACK && self.frame != Frame::ZFIN {
-                port.write_byte(XON)?;
+            if port.write_byte(b'\r')?.is_none() {
+                return Ok(None);
+            }
+            if port.write_byte(b'\n')?.is_none() {
+                return Ok(None);
+            }
+            if self.frame != Frame::ZACK
+                && self.frame != Frame::ZFIN
+                && port.write_byte(XON)?.is_none()
+            {
+                return Ok(None);
             }
         }
-        Ok(())
+        Ok(Some(()))
     }
 
     /// Reads and decodes a header from the serial port, and returns a new
@@ -266,18 +284,23 @@ impl Header {
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block
-    pub fn read<P>(port: &mut P) -> Result<Header, Error>
+    pub fn read<P>(port: &mut P) -> Result<Option<Header>, Error>
     where
         P: Read + ?Sized,
     {
-        let encoding = Encoding::try_from(port.read_byte()?)?;
+        let Some(encoding_byte) = port.read_byte()? else {
+            return Ok(None);
+        };
+        let encoding = Encoding::try_from(encoding_byte)?;
+
         let mut out_hex: Buffer<HEADER_SIZE> = Buffer::new();
         for _ in 0..Header::unescaped_size(encoding) - 1 {
-            out_hex
-                .push(read_byte_unescaped(port)?)
-                .map_err(|_| Error::OutOfMemory)?;
+            let Some(byte) = read_byte_unescaped(port)? else {
+                return Ok(None);
+            };
+            out_hex.push(byte).map_err(|_| Error::OutOfMemory)?;
         }
+
         let mut out: Buffer<HEADER_SIZE> = Buffer::new();
         if encoding == Encoding::ZHEX {
             let mut out_bytes = [0u8; HEADER_SIZE / 2];
@@ -294,7 +317,7 @@ impl Header {
         let frame = Frame::try_from(out[0])?;
         let mut header = Header::new(encoding, frame, &[0; 4]);
         header.flags.copy_from_slice(&out[1..=4]);
-        Ok(header)
+        Ok(Some(header))
     }
 
     /// Returns a new instance with the flags substitude with a count
@@ -469,7 +492,6 @@ impl State {
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block
     pub fn set_first_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
         let mut state = Self::new();
         state
@@ -523,47 +545,53 @@ impl State {
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn send<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Poll, Error>
+    pub fn send<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
         F: Read + Seek + ?Sized,
     {
-        match self.send_impl(port, file) {
-            Ok(()) => Ok(Poll::Ready),
-            Err(Error::WouldBlock) => Ok(Poll::Pending),
-            Err(e) => Err(e),
-        }
+        self.send_impl(port, file)
     }
 
-    fn send_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<(), Error>
+    fn send_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
         F: Read + Seek + ?Sized,
     {
         if self.stage == Stage::SessionBegin {
-            ZRQINIT_HEADER.write(port)?;
-        } else if self.stage == Stage::FileEnd {
-            write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?;
-            self.stage = Stage::FileBegin;
-            return Ok(());
-        }
-
-        match read_zpad(port) {
-            Ok(()) => (),
-            Err(_) => {
-                return Ok(());
+            if ZRQINIT_HEADER.write(port)?.is_none() {
+                return Ok(None);
             }
+        } else if self.stage == Stage::FileEnd {
+            if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none() {
+                return Ok(None);
+            }
+            self.stage = Stage::FileBegin;
+            return Ok(Some(()));
         }
 
-        let Ok(header) = Header::read(port) else {
-            ZNAK_HEADER.write(port)?;
-            return Ok(());
+        let Some(()) = read_zpad(port)? else {
+            return Ok(None);
+        };
+
+        let header = match Header::read(port) {
+            Ok(Some(header)) => header,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                if ZNAK_HEADER.write(port)?.is_none() {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
         };
 
         match header.frame() {
             Frame::ZRINIT => {
                 if self.stage == Stage::SessionBegin {
-                    write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?;
+                    if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none()
+                    {
+                        return Ok(None);
+                    }
                     self.stage = Stage::FileBegin;
                 } else if self.stage == Stage::FileInProgress {
                     self.stage = Stage::FileEnd;
@@ -571,19 +599,23 @@ impl State {
             }
             Frame::ZRPOS | Frame::ZACK => {
                 if self.stage == Stage::SessionBegin {
-                    ZRQINIT_HEADER.write(port)?;
+                    if ZRQINIT_HEADER.write(port)?.is_none() {
+                        return Ok(None);
+                    }
                 } else if self.stage == Stage::FileBegin || self.stage == Stage::FileInProgress {
-                    write_zdata(port, file, header.count())?;
+                    if write_zdata(port, file, header.count())?.is_none() {
+                        return Ok(None);
+                    }
                     self.stage = Stage::FileInProgress;
                 }
             }
             _ => {
-                if self.stage == Stage::SessionBegin {
-                    ZRQINIT_HEADER.write(port)?;
+                if self.stage == Stage::SessionBegin && ZRQINIT_HEADER.write(port)?.is_none() {
+                    return Ok(None);
                 }
             }
         }
-        Ok(())
+        Ok(Some(()))
     }
 
     /// Receives a file using the ZMODEM file transfer protocol.
@@ -593,88 +625,103 @@ impl State {
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn receive<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Poll, Error>
+    pub fn receive<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
         F: Write + ?Sized,
     {
-        match self.receive_impl(port, file) {
-            Ok(()) => Ok(Poll::Ready),
-            Err(Error::WouldBlock) => Ok(Poll::Pending),
-            Err(e) => Err(e),
-        }
+        self.receive_impl(port, file)
     }
 
-    fn receive_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<(), Error>
+    fn receive_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
         F: Write + ?Sized,
     {
-        if self.stage == Stage::SessionBegin {
-            write_zrinit(port)?;
-        }
-        match read_zpad(port) {
-            Ok(()) => (),
-            Err(Error::WouldBlock) => return Err(Error::WouldBlock),
-            Err(Error::Read(err)) => {
-                if self.stage == Stage::FileBegin {
-                    self.stage = Stage::SessionEnd;
-                    return Ok(());
-                }
-                return Err(Error::Read(err));
-            }
-            Err(e) => return Err(e),
+        if self.stage == Stage::SessionBegin && write_zrinit(port)?.is_none() {
+            return Ok(None);
         }
 
-        let header = match Header::read(port) {
-            Ok(header) => header,
+        let Some(()) = (match read_zpad(port) {
+            Ok(Some(v)) => Ok(Some(v)),
+            Ok(None) => return Ok(None),
             Err(Error::Read(err)) => {
                 if self.stage == Stage::FileBegin {
                     self.stage = Stage::SessionEnd;
-                    return Ok(());
+                    return Ok(Some(()));
+                }
+                Err(Error::Read(err))
+            }
+            Err(e) => Err(e),
+        })?
+        else {
+            return Ok(None);
+        };
+
+        let header = match Header::read(port) {
+            Ok(Some(header)) => header,
+            Ok(None) => return Ok(None),
+            Err(Error::Read(err)) => {
+                if self.stage == Stage::FileBegin {
+                    self.stage = Stage::SessionEnd;
+                    return Ok(Some(()));
                 }
                 return Err(Error::Read(err));
             }
-            Err(_) => {
-                ZNAK_HEADER.write(port)?;
-                return Ok(());
+            Err(e) => {
+                if ZNAK_HEADER.write(port)?.is_none() {
+                    return Ok(None);
+                }
+                return Err(e);
             }
         };
 
         match header.frame() {
             Frame::ZFILE => {
                 if self.stage == Stage::SessionBegin || self.stage == Stage::FileBegin {
-                    read_zfile(port, self, header.encoding())?;
+                    if read_zfile(port, self, header.encoding())?.is_none() {
+                        return Ok(None);
+                    }
                     self.stage = Stage::FileBegin;
                 }
             }
             Frame::ZDATA => {
                 if self.stage == Stage::SessionBegin {
-                    write_zrinit(port)?;
+                    if write_zrinit(port)?.is_none() {
+                        return Ok(None);
+                    }
                 } else if self.stage == Stage::FileBegin || self.stage == Stage::FileInProgress {
                     if header.count() != self.count {
-                        ZRPOS_HEADER.with_count(self.count).write(port)?;
-                        return Ok(());
+                        if ZRPOS_HEADER.with_count(self.count).write(port)?.is_none() {
+                            return Ok(None);
+                        }
+                        return Ok(Some(()));
                     }
-                    read_zdata(port, self, header.encoding(), file)?;
+                    if read_zdata(port, self, header.encoding(), file)?.is_none() {
+                        return Ok(None);
+                    }
                     self.stage = Stage::FileInProgress;
                 }
             }
             Frame::ZEOF => {
                 if self.stage == Stage::FileInProgress && header.count() == self.count {
-                    write_zrinit(port)?;
+                    if write_zrinit(port)?.is_none() {
+                        return Ok(None);
+                    }
                     self.stage = Stage::FileBegin;
                 }
             }
             Frame::ZFIN => {
                 if self.stage == Stage::FileInProgress || self.stage == Stage::FileBegin {
-                    ZFIN_HEADER.write(port)?;
+                    if ZFIN_HEADER.write(port)?.is_none() {
+                        return Ok(None);
+                    }
                     self.stage = Stage::SessionEnd;
                 }
             }
             _ => {}
         }
-        Ok(())
+        Ok(Some(()))
     }
 
     /// Send ZFIN.
@@ -684,44 +731,54 @@ impl State {
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn finish<P>(&mut self, port: &mut P) -> Result<Poll, Error>
+    pub fn finish<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
     {
-        match self.finish_impl(port) {
-            Ok(()) => Ok(Poll::Ready),
-            Err(Error::WouldBlock) => Ok(Poll::Pending),
-            Err(e) => Err(e),
-        }
+        self.finish_impl(port)
     }
 
-    fn finish_impl<P>(&mut self, port: &mut P) -> Result<(), Error>
+    fn finish_impl<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
     {
-        ZFIN_HEADER.write(port)?;
-
-        if read_zpad(port).is_err() {
-            return Ok(());
+        if ZFIN_HEADER.write(port)?.is_none() {
+            return Ok(None);
         }
 
-        let Ok(frame) = Header::read(port) else {
-            ZNAK_HEADER.write(port)?;
-            return Ok(());
+        let Some(()) = read_zpad(port)? else {
+            return Ok(None);
+        };
+
+        let frame = match Header::read(port) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                if ZNAK_HEADER.write(port)?.is_none() {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
         };
 
         match frame.frame() {
             Frame::ZFIN | Frame::ZRINIT => {
-                port.write_byte(b'O')?;
-                port.write_byte(b'O')?;
+                if port.write_byte(b'O')?.is_none() {
+                    return Ok(None);
+                }
+                if port.write_byte(b'O')?.is_none() {
+                    return Ok(None);
+                }
                 self.stage = Stage::SessionEnd;
             }
             _ => {
-                ZFIN_HEADER.write(port)?;
+                if ZFIN_HEADER.write(port)?.is_none() {
+                    return Ok(None);
+                }
             }
         }
 
-        Ok(())
+        Ok(Some(()))
     }
 }
 
@@ -735,7 +792,7 @@ pub enum Stage {
 }
 
 /// Writes ZRINIT
-fn write_zrinit<P>(port: &mut P) -> Result<(), Error>
+fn write_zrinit<P>(port: &mut P) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
@@ -792,7 +849,7 @@ fn write_zfile<P>(
     buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
     name: &[u8],
     size: u32,
-) -> Result<(), Error>
+) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
@@ -806,18 +863,24 @@ where
     buf.extend_from_slice(size_bytes)
         .map_err(|_| Error::OutOfMemory)?;
     buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
-    Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4]).write(port)?;
+
+    if Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4])
+        .write(port)?
+        .is_none()
+    {
+        return Ok(None);
+    }
     write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, buf)
 }
 
 /// Parses filename and size from the subpacket sent after the `Frame::ZFiLE`
 /// header.
-fn read_zfile<P>(port: &mut P, state: &mut State, encoding: Encoding) -> Result<(), Error>
+fn read_zfile<P>(port: &mut P, state: &mut State, encoding: Encoding) -> Result<Option<()>, Error>
 where
     P: Read + Write + ?Sized,
 {
     match read_subpacket(port, &mut state.buf, encoding) {
-        Ok(_) => {
+        Ok(Some(_)) => {
             let payload = &state.buf;
             let mut fields = payload.split(|&b| b == b'\0');
 
@@ -849,15 +912,18 @@ where
 
             ZRPOS_HEADER.with_count(0).write(port)
         }
+        Ok(None) => Ok(None),
         Err(e) => {
-            ZNAK_HEADER.write(port)?;
+            if ZNAK_HEADER.write(port)?.is_none() {
+                return Ok(None);
+            }
             Err(e)
         }
     }
 }
 
 /// Writes ZDATA
-fn write_zdata<P, F>(port: &mut P, file: &mut F, offset: u32) -> Result<(), Error>
+fn write_zdata<P, F>(port: &mut P, file: &mut F, offset: u32) -> Result<Option<()>, Error>
 where
     P: Read + Write + ?Sized,
     F: Read + Seek + ?Sized,
@@ -866,21 +932,35 @@ where
     let mut local_buf = [0u8; SUBPACKET_MAX_SIZE];
     let read_buf = &mut local_buf[..SUBPACKET_MAX_SIZE];
 
-    let new_offset = file.seek(offset)?;
+    let Some(new_offset) = file.seek(offset)? else {
+        return Ok(None);
+    };
     if new_offset != offset {
         return Err(Error::UnexpectedEof);
     }
 
-    let mut count = file.read(read_buf)? as usize;
+    let Some(count) = file.read(read_buf)? else {
+        return Ok(None);
+    };
+    let mut count = count as usize;
+
     if count == 0 {
         ZEOF_HEADER.with_count(offset).write(port)?;
-        return Ok(());
+        return Ok(Some(()));
     }
-    ZDATA_HEADER.with_count(offset).write(port)?;
+    if ZDATA_HEADER.with_count(offset).write(port)?.is_none() {
+        return Ok(None);
+    }
     for _ in 1..SUBPACKET_PER_ACK {
-        write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCG, &read_buf[..count])?;
+        if write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCG, &read_buf[..count])?.is_none() {
+            return Ok(None);
+        }
         offset += u32::try_from(count).map_err(|_| Error::OutOfMemory)?;
-        count = file.read(read_buf)? as usize;
+
+        let Some(new_count) = file.read(read_buf)? else {
+            return Ok(None);
+        };
+        count = new_count as usize;
         if count < read_buf.len() {
             break;
         }
@@ -894,28 +974,41 @@ fn read_zdata<P, F>(
     state: &mut State,
     encoding: Encoding,
     file: &mut F,
-) -> Result<(), Error>
+) -> Result<Option<()>, Error>
 where
     P: Read + Write + ?Sized,
     F: Write + ?Sized,
 {
     loop {
-        let Ok(zcrc) = read_subpacket(port, &mut state.buf, encoding) else {
-            ZNAK_HEADER.with_count(state.count).write(port)?;
-            continue;
+        let zcrc = match read_subpacket(port, &mut state.buf, encoding) {
+            Ok(Some(zcrc)) => zcrc,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                if ZNAK_HEADER.with_count(state.count).write(port)?.is_none() {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
         };
-        file.write_all(&state.buf)?;
+
+        if file.write_all(&state.buf)?.is_none() {
+            return Ok(None);
+        }
         state.count += u32::try_from(state.buf.len()).map_err(|_| Error::OutOfMemory)?;
         match zcrc {
             Packet::ZCRCW => {
-                ZACK_HEADER.with_count(state.count).write(port)?;
-                return Ok(());
+                if ZACK_HEADER.with_count(state.count).write(port)?.is_none() {
+                    return Ok(None);
+                }
+                return Ok(Some(()));
             }
             Packet::ZCRCE => {
-                return Ok(());
+                return Ok(Some(()));
             }
             Packet::ZCRCQ => {
-                ZACK_HEADER.with_count(state.count).write(port)?;
+                if ZACK_HEADER.with_count(state.count).write(port)?.is_none() {
+                    return Ok(None);
+                }
             }
             Packet::ZCRCG => (),
         }
@@ -928,25 +1021,31 @@ where
 ///
 /// Returns `Error::Data` if the sequence is malformed or `Error::Read` on an
 /// I/O error.
-fn read_zpad<P>(port: &mut P) -> Result<(), Error>
+fn read_zpad<P>(port: &mut P) -> Result<Option<()>, Error>
 where
     P: Read + ?Sized,
 {
     loop {
-        let b = port.read_byte()?;
+        let Some(b) = port.read_byte()? else {
+            return Ok(None);
+        };
         if b != ZPAD {
             continue;
         }
 
-        let b = port.read_byte()?;
+        let Some(b) = port.read_byte()? else {
+            return Ok(None);
+        };
         if b == ZDLE {
-            return Ok(());
+            return Ok(Some(()));
         }
 
         if b == ZPAD {
-            let b = port.read_byte()?;
+            let Some(b) = port.read_byte()? else {
+                return Ok(None);
+            };
             if b == ZDLE {
-                return Ok(());
+                return Ok(Some(()));
             }
         }
     }
@@ -966,7 +1065,7 @@ fn read_subpacket<P>(
     port: &mut P,
     buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
     encoding: Encoding,
-) -> Result<Packet, Error>
+) -> Result<Option<Packet>, Error>
 where
     P: Read + ?Sized,
 {
@@ -975,9 +1074,13 @@ where
     let (mut crc16, mut crc32) = (crc::Crc16::new(), crc::Crc32::new());
 
     let result = loop {
-        let byte = port.read_byte()?;
+        let Some(byte) = port.read_byte()? else {
+            return Ok(None);
+        };
         if byte == ZDLE {
-            let byte = port.read_byte()?;
+            let Some(byte) = port.read_byte()? else {
+                return Ok(None);
+            };
             if let Ok(packet) = Packet::try_from(byte) {
                 if encoding == Encoding::ZBIN32 {
                     crc32.update_byte(packet as u8);
@@ -1006,7 +1109,10 @@ where
     let crc_len = if encoding == Encoding::ZBIN32 { 4 } else { 2 };
     let mut crc_bytes = [0u8; 4];
     for b in crc_bytes.iter_mut().take(crc_len) {
-        *b = read_byte_unescaped(port)?;
+        let Some(byte) = read_byte_unescaped(port)? else {
+            return Ok(None);
+        };
+        *b = byte;
     }
 
     if encoding == Encoding::ZBIN32 {
@@ -1017,30 +1123,7 @@ where
         return Err(Error::UnexpectedCrc16);
     }
 
-    Ok(result)
-}
-
-/// Skips the tail of the subpacket (including CRC).
-fn skip_subpacket_tail<P>(port: &mut P, encoding: Encoding) -> Result<Packet, Error>
-where
-    P: Read + ?Sized,
-{
-    let result;
-    loop {
-        let byte = port.read_byte()?;
-        if byte == ZDLE {
-            let byte = port.read_byte()?;
-            if let Ok(packet) = Packet::try_from(byte) {
-                result = packet;
-                break;
-            }
-        }
-    }
-    let crc_len = if encoding == Encoding::ZBIN32 { 4 } else { 2 };
-    for _ in 0..crc_len {
-        read_byte_unescaped(port)?;
-    }
-    Ok(result)
+    Ok(Some(result))
 }
 
 /// Writes a subpacket.
@@ -1054,14 +1137,20 @@ fn write_subpacket<P>(
     encoding: Encoding,
     kind: Packet,
     data: &[u8],
-) -> Result<(), Error>
+) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
     let kind = kind as u8;
-    write_slice_escaped(port, data)?;
-    port.write_byte(ZDLE)?;
-    port.write_byte(kind)?;
+    if write_slice_escaped(port, data)?.is_none() {
+        return Ok(None);
+    }
+    if port.write_byte(ZDLE)?.is_none() {
+        return Ok(None);
+    }
+    if port.write_byte(kind)?.is_none() {
+        return Ok(None);
+    }
     match encoding {
         Encoding::ZBIN32 => {
             let mut crc = crc::Crc32::new();
@@ -1106,36 +1195,43 @@ fn make_crc(data: &[u8], out: &mut [u8], encoding: Encoding) -> usize {
 }
 
 #[allow(dead_code)]
-fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<(), Error>
+fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
     for value in buf {
-        write_byte_escaped(port, *value)?;
+        if write_byte_escaped(port, *value)?.is_none() {
+            return Ok(None);
+        }
     }
 
-    Ok(())
+    Ok(Some(()))
 }
 
-fn write_byte_escaped<P>(port: &mut P, value: u8) -> Result<(), Error>
+fn write_byte_escaped<P>(port: &mut P, value: u8) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
     let escaped = zdle::ZDLE_TABLE[value as usize];
-    if escaped != value {
-        port.write_byte(ZDLE)?;
+    if escaped != value && port.write_byte(ZDLE)?.is_none() {
+        return Ok(None);
     }
     port.write_byte(escaped)
 }
 
-fn read_byte_unescaped<P>(port: &mut P) -> Result<u8, Error>
+fn read_byte_unescaped<P>(port: &mut P) -> Result<Option<u8>, Error>
 where
     P: Read + ?Sized,
 {
-    let b = port.read_byte()?;
-    Ok(if b == ZDLE {
-        zdle::UNZDLE_TABLE[port.read_byte()? as usize]
+    let Some(b) = port.read_byte()? else {
+        return Ok(None);
+    };
+    Ok(Some(if b == ZDLE {
+        let Some(b) = port.read_byte()? else {
+            return Ok(None);
+        };
+        zdle::UNZDLE_TABLE[b as usize]
     } else {
         b
-    })
+    }))
 }

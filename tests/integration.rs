@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use zmodem2::{Poll, Stage, State};
+use zmodem2::{Stage, State};
 
 const FILE_COUNT: usize = 10;
 const FILE_SIZE: usize = 50 * 1024;
@@ -244,8 +244,8 @@ fn test_batch_from_sz() {
             .unwrap_or(&mut sink);
 
         match state.receive(&mut port, &mut file_writer) {
-            Ok(Poll::Ready) => continue,
-            Ok(Poll::Pending) => {
+            Ok(Some(())) => continue,
+            Ok(None) => {
                 sleep(Duration::from_millis(10));
             }
             Err(e) => panic!("receive failed: {e}"),
@@ -253,7 +253,7 @@ fn test_batch_from_sz() {
     }
 
     let mut drain = [0u8; 1024];
-    while let Ok(Poll::Pending) = state.receive(&mut port, &mut sink) {
+    while let Ok(None) = state.receive(&mut port, &mut sink) {
         let _ = unistd::read(port.r.as_raw_fd(), &mut drain);
         sleep(Duration::from_millis(10));
     }
@@ -314,8 +314,8 @@ fn test_batch_to_rz() {
             .expect("File not found in map");
 
         match state.send(&mut port, file) {
-            Ok(Poll::Ready) => continue,
-            Ok(Poll::Pending) => {
+            Ok(Some(())) => continue,
+            Ok(None) => {
                 sleep(Duration::from_millis(10));
             }
             Err(e) => panic!("send failed: {e}"),
@@ -324,8 +324,8 @@ fn test_batch_to_rz() {
 
     while state.stage() != Stage::SessionEnd {
         match state.finish(&mut port) {
-            Ok(Poll::Ready) => {}
-            Ok(Poll::Pending) => {
+            Ok(Some(())) => {}
+            Ok(None) => {
                 sleep(Duration::from_millis(50));
             }
             Err(e) => panic!("finish failed: {e}"),

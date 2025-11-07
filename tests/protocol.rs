@@ -4,7 +4,7 @@
 
 use core::cmp;
 use rstest::rstest;
-use zmodem2::{Encoding, Error, Frame, Header, Poll, Read, State, Write, XON, ZDLE, ZPAD};
+use zmodem2::{Encoding, Error, Frame, Header, Read, State, Write, XON, ZDLE, ZPAD};
 
 struct MockPort<'a> {
     input: &'a [u8],
@@ -21,35 +21,35 @@ impl<'a> MockPort<'a> {
 }
 
 impl<'a> Read for MockPort<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<u32, Error> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error> {
         if self.input.is_empty() {
-            return Err(Error::WouldBlock);
+            return Ok(None);
         }
         let n = cmp::min(self.input.len(), buf.len());
         buf[..n].copy_from_slice(&self.input[..n]);
         self.input = &self.input[n..];
-        Ok(n as u32)
+        Ok(Some(n as u32))
     }
 
-    fn read_byte(&mut self) -> Result<u8, Error> {
+    fn read_byte(&mut self) -> Result<Option<u8>, Error> {
         if let Some((&first, rest)) = self.input.split_first() {
             self.input = rest;
-            Ok(first)
+            Ok(Some(first))
         } else {
-            Err(Error::WouldBlock)
+            Ok(None)
         }
     }
 }
 
 impl<'a> Write for MockPort<'a> {
-    fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
+    fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error> {
         self.output.extend_from_slice(buf);
-        Ok(())
+        Ok(Some(()))
     }
 
-    fn write_byte(&mut self, value: u8) -> Result<(), Error> {
+    fn write_byte(&mut self, value: u8) -> Result<Option<()>, Error> {
         self.output.push(value);
-        Ok(())
+        Ok(Some(()))
     }
 }
 
@@ -66,7 +66,7 @@ pub fn test_header_write(
 ) {
     let header = Header::new(encoding, frame, flags);
     let mut port = vec![];
-    assert!(header.write(&mut port) == Ok(()));
+    assert!(header.write(&mut port) == Ok(Some(())));
     assert_eq!(port, expected);
 }
 
@@ -83,7 +83,7 @@ pub fn test_header_read(
 ) {
     let port = &mut port.to_vec();
     let port = &mut port.as_slice();
-    assert!(Header::read(port) == Ok(Header::new(encoding, frame, flags)));
+    assert!(Header::read(port) == Ok(Some(Header::new(encoding, frame, flags))));
 }
 
 #[test]
@@ -93,5 +93,5 @@ fn test_receive_malformed_header() {
     let mut state = State::new();
 
     let result = state.receive(&mut mock_port, &mut file);
-    assert!(matches!(result, Ok(Poll::Pending)));
+    assert!(matches!(result, Ok(None)));
 }

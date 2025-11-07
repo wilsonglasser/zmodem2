@@ -14,8 +14,6 @@ pub trait Write {
     /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial
     /// port.
-    /// [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would
-    /// block.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the
     /// serial port.
     fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error>;
@@ -27,11 +25,9 @@ pub trait Write {
     /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial
     /// port.
-    /// [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would
-    /// block.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the
     /// serial port.
-    fn write_byte(&mut self, value: u8) -> Result<Option<(), Error> {
+    fn write_byte(&mut self, value: u8) -> Result<Option<()>, Error> {
         self.write_all(&[value])
     }
 }
@@ -44,7 +40,6 @@ pub trait Read {
     ///
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
-    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block.
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
     fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error>;
 
@@ -54,7 +49,6 @@ pub trait Read {
     ///
     /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
-    /// [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
     fn read_byte(&mut self) -> Result<Option<u8>, Error>;
 }
@@ -67,7 +61,6 @@ pub trait Seek {
     ///
     /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
-    /// [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
     fn seek(&mut self, offset: u32) -> Result<Option<u32>, Error>;
 }
