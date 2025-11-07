@@ -46,9 +46,6 @@ use strum::IntoEnumIterator;
 /// original ZMODEM specification.
 const SUBPACKET_MAX_SIZE: usize = 1024;
 
-/// Size of the unescaped payload plus one byte for CRC type storage.
-const SUBPACKET_CRC_MAX_SIZE: usize = SUBPACKET_MAX_SIZE + 1;
-
 /// Buffer size with enough capacity for an escaped header
 const HEADER_SIZE: usize = 32;
 
@@ -452,7 +449,7 @@ pub struct State {
     count: u32,
     file_name: String,
     file_size: u32,
-    buf: Buffer<SUBPACKET_CRC_MAX_SIZE>,
+    buf: Buffer<SUBPACKET_MAX_SIZE>,
 }
 
 impl Default for State {
@@ -470,7 +467,7 @@ impl State {
             count: 0,
             file_name: String::new(),
             file_size: 0,
-            buf: Buffer::<SUBPACKET_CRC_MAX_SIZE>::new(),
+            buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
         }
     }
 
@@ -801,7 +798,7 @@ fn parse_file_size(bytes: &[u8]) -> Result<u32, Error> {
 /// Write ZRFILE
 fn write_zfile<P>(
     port: &mut P,
-    buf: &mut Buffer<SUBPACKET_CRC_MAX_SIZE>,
+    buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
     name: &[u8],
     size: u32,
 ) -> Result<(), Error>
@@ -976,42 +973,59 @@ where
 /// pop the CRC byte, which should not happen in a valid transmission.
 fn read_subpacket<P>(
     port: &mut P,
-    buf: &mut Buffer<SUBPACKET_CRC_MAX_SIZE>,
+    buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
     encoding: Encoding,
 ) -> Result<Packet, Error>
 where
     P: Read + ?Sized,
 {
     buf.clear();
+
+    let (mut crc16, mut crc32) = (crc::Crc16::new(), crc::Crc32::new());
+
     let result = loop {
         let byte = port.read_byte()?;
         if byte == ZDLE {
             let byte = port.read_byte()?;
             if let Ok(packet) = Packet::try_from(byte) {
-                buf.push(packet as u8).map_err(|_| Error::OutOfMemory)?;
+                if encoding == Encoding::ZBIN32 {
+                    crc32.update_byte(packet as u8);
+                } else {
+                    crc16.update_byte(packet as u8);
+                }
                 break packet;
             }
-            buf.push(zdle::UNZDLE_TABLE[byte as usize])
-                .map_err(|_| Error::OutOfMemory)?;
+            let unescaped = zdle::UNZDLE_TABLE[byte as usize];
+            buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
+            if encoding == Encoding::ZBIN32 {
+                crc32.update_byte(unescaped);
+            } else {
+                crc16.update_byte(unescaped);
+            }
         } else {
             buf.push(byte).map_err(|_| Error::OutOfMemory)?;
-        }
-
-        if buf.len() == buf.capacity() {
-            let packet = skip_subpacket_tail(port, encoding)?;
-            buf.clear();
-            return Ok(packet);
+            if encoding == Encoding::ZBIN32 {
+                crc32.update_byte(byte);
+            } else {
+                crc16.update_byte(byte);
+            }
         }
     };
 
     let crc_len = if encoding == Encoding::ZBIN32 { 4 } else { 2 };
-    let mut crc = [0u8; 4];
-    for b in crc.iter_mut().take(crc_len) {
+    let mut crc_bytes = [0u8; 4];
+    for b in crc_bytes.iter_mut().take(crc_len) {
         *b = read_byte_unescaped(port)?;
     }
-    check_crc(buf, &crc[..crc_len], encoding)?;
 
-    buf.pop().ok_or(Error::MalformedHeader)?;
+    if encoding == Encoding::ZBIN32 {
+        if crc32.finalize().to_le_bytes() != crc_bytes {
+            return Err(Error::UnexpectedCrc32);
+        }
+    } else if crc16.finalize().to_be_bytes() != [crc_bytes[0], crc_bytes[1]] {
+        return Err(Error::UnexpectedCrc16);
+    }
+
     Ok(result)
 }
 
@@ -1059,27 +1073,17 @@ where
     port.write_byte(kind)?;
     match encoding {
         Encoding::ZBIN32 => {
-            let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
-            crc_buf
-                .extend_from_slice(data)
-                .map_err(|_| Error::OutOfMemory)?;
-            crc_buf.push(kind).map_err(|_| Error::OutOfMemory)?;
-
-            let mut buf = [0u8; 4];
-            let crc = crc::crc32_iso_hdlc(&crc_buf).to_le_bytes();
-            buf.copy_from_slice(&crc);
+            let mut crc = crc::Crc32::new();
+            crc.update(data);
+            crc.update_byte(kind);
+            let buf = crc.finalize().to_le_bytes();
             write_slice_escaped(port, &buf)
         }
         Encoding::ZBIN => {
-            let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
-            crc_buf
-                .extend_from_slice(data)
-                .map_err(|_| Error::OutOfMemory)?;
-            crc_buf.push(kind).map_err(|_| Error::OutOfMemory)?;
-
-            let mut buf = [0u8; 2];
-            let crc = crc::crc16_xmodem(&crc_buf).to_be_bytes();
-            buf.copy_from_slice(&crc);
+            let mut crc = crc::Crc16::new();
+            crc.update(data);
+            crc.update_byte(kind);
+            let buf = crc.finalize().to_be_bytes();
             write_slice_escaped(port, &buf)
         }
         Encoding::ZHEX => Err(Error::Unsupported),

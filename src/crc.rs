@@ -42,3 +42,79 @@ pub const fn crc32_iso_hdlc(data: &[u8]) -> u32 {
     }
     !crc
 }
+
+/// A stateful, iterative CRC-16-XMODEM calculator.
+pub struct Crc16 {
+    crc: u16,
+}
+
+impl Crc16 {
+    /// Creates a new CRC-16 calculator.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { crc: 0x0000 }
+    }
+
+    /// Updates the CRC state with a slice of bytes.
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.update_byte(byte);
+        }
+    }
+
+    /// Updates the CRC state with a single byte.
+    pub fn update_byte(&mut self, byte: u8) {
+        self.crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            if (self.crc & 0x8000) != 0 {
+                self.crc = (self.crc << 1) ^ 0x1021;
+            } else {
+                self.crc <<= 1;
+            }
+        }
+    }
+
+    /// Finalizes the CRC calculation and returns the checksum.
+    #[must_use]
+    pub const fn finalize(&self) -> u16 {
+        self.crc
+    }
+}
+
+/// A stateful, iterative CRC-32-ISO-HDLC calculator.
+pub struct Crc32 {
+    crc: u32,
+}
+
+impl Crc32 {
+    /// Creates a new CRC-32 calculator.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { crc: 0xFFFF_FFFF }
+    }
+
+    /// Updates the CRC state with a slice of bytes.
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.update_byte(byte);
+        }
+    }
+
+    /// Updates the CRC state with a single byte.
+    pub fn update_byte(&mut self, byte: u8) {
+        self.crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if (self.crc & 1) != 0 {
+                self.crc = (self.crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                self.crc >>= 1;
+            }
+        }
+    }
+
+    /// Finalizes the CRC calculation and returns the checksum.
+    #[must_use]
+    pub const fn finalize(&self) -> u32 {
+        !self.crc
+    }
+}
