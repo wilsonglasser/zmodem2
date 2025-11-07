@@ -30,7 +30,7 @@ mod zdle;
 
 pub use buffer::*;
 pub use error::*;
-pub use io::{Read, Seek, Write};
+pub use io::*;
 
 use bitflags::bitflags;
 use core::{
@@ -174,7 +174,7 @@ impl fmt::Debug for String {
 
 impl fmt::Display for String {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&core::str::from_utf8(&self.0).unwrap_or(""))
+        f.write_str(core::str::from_utf8(&self.0).unwrap_or(""))
     }
 }
 
@@ -230,10 +230,10 @@ impl Header {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    /// * `Err(Error::WouldBlock)` when the I/O operation would block
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
+    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block
     pub fn write<P>(&self, port: &mut P) -> Result<(), Error>
     where
         P: Write + ?Sized,
@@ -245,22 +245,18 @@ impl Header {
         }
         port.write_byte(ZDLE)?;
         port.write_byte(self.encoding as u8)?;
-        out.push(self.frame as u8)
-            .map_err(|_| MarshalError::CapacityExceeded("Header::write", out.capacity()))?;
+        out.push(self.frame as u8).map_err(|_| Error::OutOfMemory)?;
         out.extend_from_slice(&self.flags)
-            .map_err(|_| MarshalError::CapacityExceeded("Header::write", out.capacity()))?;
+            .map_err(|_| Error::OutOfMemory)?;
         let mut crc = [0u8; 4];
         let crc_len = make_crc(&out, &mut crc, self.encoding);
         out.extend_from_slice(&crc[..crc_len])
-            .map_err(|_| MarshalError::CapacityExceeded("Header::write", out.capacity()))?;
+            .map_err(|_| Error::OutOfMemory)?;
         if self.encoding == Encoding::ZHEX {
             let mut hex_buf = [0u8; HEADER_SIZE];
             let len = out.len() * 2;
-            let hex = &mut hex_buf
-                .get_mut(..len)
-                .ok_or(MarshalError::CapacityExceeded("Header::write", len))?;
-            hex::encode_to_slice(&out, hex)
-                .map_err(|_| MarshalError::CapacityExceeded("Header::write::hex", hex.len()))?;
+            let hex = &mut hex_buf.get_mut(..len).ok_or(Error::UnexpectedEof)?;
+            hex::encode_to_slice(&out, hex).map_err(|_| Error::OutOfMemory)?;
             write_slice_escaped(port, hex)?;
         } else {
             write_slice_escaped(port, &out)?;
@@ -280,10 +276,10 @@ impl Header {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    /// * `Err(Error::WouldBlock)` when the I/O operation would block
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
+    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block
     pub fn read<P>(port: &mut P) -> Result<Header, Error>
     where
         P: Read + ?Sized,
@@ -291,21 +287,21 @@ impl Header {
         let encoding = Encoding::try_from(port.read_byte()?)?;
         let mut out_hex: Buffer<HEADER_SIZE> = Buffer::new();
         for _ in 0..Header::unescaped_size(encoding) - 1 {
-            out_hex.push(read_byte_unescaped(port)?).map_err(|_| {
-                UnmarshalError::CapacityExceeded("Header::read", out_hex.capacity())
-            })?;
+            out_hex
+                .push(read_byte_unescaped(port)?)
+                .map_err(|_| Error::OutOfMemory)?;
         }
         let mut out: Buffer<HEADER_SIZE> = Buffer::new();
         if encoding == Encoding::ZHEX {
             let mut out_bytes = [0u8; HEADER_SIZE / 2];
             let out_len = out_hex.len() / 2;
             hex::decode_to_slice(&out_hex, &mut out_bytes[..out_len])
-                .map_err(|_| UnmarshalError::MalformedHeader)?;
+                .map_err(|_| Error::MalformedHeader)?;
             out.extend_from_slice(&out_bytes[..out_len])
-                .map_err(|_| UnmarshalError::CapacityExceeded("Header::read", out.capacity()))?;
+                .map_err(|_| Error::OutOfMemory)?;
         } else {
             out.extend_from_slice(&out_hex)
-                .map_err(|_| UnmarshalError::CapacityExceeded("Header::read", out.capacity()))?;
+                .map_err(|_| Error::OutOfMemory)?;
         }
         check_crc(&out[..5], &out[5..], encoding)?;
         let frame = Frame::try_from(out[0])?;
@@ -347,7 +343,7 @@ impl TryFrom<u8> for Encoding {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Encoding::iter()
             .find(|e| value == *e as u8)
-            .ok_or(Error::Unmarshal(UnmarshalError::MalformedEncoding(value)))
+            .ok_or(Error::MalformedEncoding(value))
     }
 }
 
@@ -404,7 +400,7 @@ impl TryFrom<u8> for Frame {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Frame::iter()
             .find(|t| value == *t as u8)
-            .ok_or(Error::Unmarshal(UnmarshalError::MalformedFrame(value)))
+            .ok_or(Error::MalformedFrame(value))
     }
 }
 
@@ -447,7 +443,7 @@ impl TryFrom<u8> for Packet {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Packet::iter()
             .find(|e| value == *e as u8)
-            .ok_or(Error::Unmarshal(UnmarshalError::MalformedPacket(value)))
+            .ok_or(Error::MalformedPacket(value))
     }
 }
 
@@ -483,18 +479,16 @@ impl State {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
-    /// * `Err(Error::WouldBlock)` when the I/O operation would block
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
+    /// * [`WouldBlock`](crate::Error::WouldBlock) when the I/O operation would block
     pub fn set_first_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
         let mut state = Self::new();
         state
             .file_name
             .extend_from_slice(file_name.as_bytes())
-            .map_err(|_| {
-                MarshalError::CapacityExceeded("State::file_name", state.file_name.capacity())
-            })?;
+            .map_err(|_| Error::OutOfMemory)?;
         state.file_size = file_size;
         Ok(state)
     }
@@ -503,14 +497,12 @@ impl State {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Data)` when the `file_name` is invalid.
+    /// * [`Data`](crate::Error::Data) when the `file_name` is invalid.
     pub fn set_next_file(&mut self, file_name: &str, file_size: u32) -> Result<(), Error> {
         self.file_name.clear();
         self.file_name
             .extend_from_slice(file_name.as_bytes())
-            .map_err(|_| {
-                MarshalError::CapacityExceeded("State::file_name", self.file_name.capacity())
-            })?;
+            .map_err(|_| Error::OutOfMemory)?;
         self.file_size = file_size;
         self.count = 0;
         self.stage = Stage::FileEnd;
@@ -541,9 +533,9 @@ impl State {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
     pub fn send<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Poll, Error>
     where
         P: Read + Write + ?Sized,
@@ -551,7 +543,7 @@ impl State {
     {
         match self.send_impl(port, file) {
             Ok(()) => Ok(Poll::Ready),
-            Err(Error::Io(IoError::WouldBlock)) => Ok(Poll::Pending),
+            Err(Error::WouldBlock) => Ok(Poll::Pending),
             Err(e) => Err(e),
         }
     }
@@ -571,10 +563,9 @@ impl State {
 
         match read_zpad(port) {
             Ok(()) => (),
-            Err(Error::Unmarshal(_)) => {
+            Err(_) => {
                 return Ok(());
             }
-            Err(e) => return Err(e),
         }
 
         let Ok(header) = Header::read(port) else {
@@ -612,9 +603,9 @@ impl State {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
     pub fn receive<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Poll, Error>
     where
         P: Read + Write + ?Sized,
@@ -622,7 +613,7 @@ impl State {
     {
         match self.receive_impl(port, file) {
             Ok(()) => Ok(Poll::Ready),
-            Err(Error::Io(IoError::WouldBlock)) => Ok(Poll::Pending),
+            Err(Error::WouldBlock) => Ok(Poll::Pending),
             Err(e) => Err(e),
         }
     }
@@ -636,32 +627,31 @@ impl State {
             write_zrinit(port)?;
         }
         match read_zpad(port) {
-            Ok(()) => { /* ZPAD detected, continue to read header */ }
-            Err(Error::Io(IoError::WouldBlock)) => return Err(Error::Io(IoError::WouldBlock)),
-            Err(Error::Io(IoError::Read(err))) => {
+            Ok(()) => (),
+            Err(Error::WouldBlock) => return Err(Error::WouldBlock),
+            Err(Error::Read(err)) => {
                 if self.stage == Stage::FileBegin {
                     self.stage = Stage::SessionEnd;
                     return Ok(());
                 }
-                return Err(IoError::Read(err).into());
+                return Err(Error::Read(err));
             }
             Err(e) => return Err(e),
         }
 
         let header = match Header::read(port) {
             Ok(header) => header,
-            Err(Error::Io(IoError::Read(err))) => {
+            Err(Error::Read(err)) => {
                 if self.stage == Stage::FileBegin {
                     self.stage = Stage::SessionEnd;
                     return Ok(());
                 }
-                return Err(IoError::Read(err).into());
+                return Err(Error::Read(err));
             }
-            Err(Error::Unmarshal(_)) => {
+            Err(_) => {
                 ZNAK_HEADER.write(port)?;
                 return Ok(());
             }
-            Err(e) => return Err(e),
         };
 
         match header.frame() {
@@ -704,16 +694,16 @@ impl State {
     ///
     /// # Errors
     ///
-    /// * `Err(Error::Read)` when the read I/O fails with the serial port
-    /// * `Err(Error::Write)` when the write I/O fails with the serial port
-    /// * `Err(Error::Data)` when corrupted data has been detected
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
     pub fn finish<P>(&mut self, port: &mut P) -> Result<Poll, Error>
     where
         P: Read + Write + ?Sized,
     {
         match self.finish_impl(port) {
             Ok(()) => Ok(Poll::Ready),
-            Err(Error::Io(IoError::WouldBlock)) => Ok(Poll::Pending),
+            Err(Error::WouldBlock) => Ok(Poll::Pending),
             Err(e) => Err(e),
         }
     }
@@ -804,13 +794,11 @@ where
 
     buf.clear();
     buf.extend_from_slice(name)
-        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::name", buf.capacity()))?;
-    buf.push(b'\0')
-        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::nul", buf.capacity()))?;
+        .map_err(|_| Error::OutOfMemory)?;
+    buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
     buf.extend_from_slice(size_bytes)
-        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::size", buf.capacity()))?;
-    buf.push(b'\0')
-        .map_err(|_| MarshalError::CapacityExceeded("write_zfile::nul", buf.capacity()))?;
+        .map_err(|_| Error::OutOfMemory)?;
+    buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
     Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4]).write(port)?;
     write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, buf)
 }
@@ -826,20 +814,18 @@ where
             let payload = &state.buf;
             let mut fields = payload.split(|&b| b == b'\0');
 
-            let file_name_bytes = fields.next().ok_or(UnmarshalError::MalformedFileName)?;
+            let file_name_bytes = fields.next().ok_or(Error::MalformedFileName)?;
             if file_name_bytes.is_empty() {
-                return Err(UnmarshalError::MalformedFileName.into());
+                return Err(Error::MalformedFileName);
             }
 
-            core::str::from_utf8(file_name_bytes).map_err(|_| UnmarshalError::MalformedFileName)?;
+            core::str::from_utf8(file_name_bytes).map_err(|_| Error::MalformedFileName)?;
 
             state.file_name.clear();
             state
                 .file_name
                 .extend_from_slice(file_name_bytes)
-                .map_err(|_| {
-                    UnmarshalError::CapacityExceeded("read_zfile::name", state.file_name.capacity())
-                })?;
+                .map_err(|_| Error::OutOfMemory)?;
 
             if let Some(size_str_bytes) = fields.next() {
                 let size_field_bytes = size_str_bytes
@@ -851,9 +837,9 @@ where
                     state.file_size = 0;
                 } else {
                     let size_str = core::str::from_utf8(size_field_bytes)
-                        .map_err(|_| UnmarshalError::MalformedFileSize)?;
+                        .map_err(|_| Error::MalformedFileSize)?;
                     state.file_size =
-                        u32::from_str(size_str).map_err(|_| UnmarshalError::MalformedFileSize)?;
+                        u32::from_str(size_str).map_err(|_| Error::MalformedFileSize)?;
                 }
             } else {
                 state.file_size = 0;
@@ -882,7 +868,7 @@ where
 
     let new_offset = file.seek(offset)?;
     if new_offset != offset {
-        return Err(MarshalError::FileTruncated.into());
+        return Err(Error::UnexpectedEof);
     }
 
     let mut count = file.read(read_buf)? as usize;
@@ -893,9 +879,7 @@ where
     ZDATA_HEADER.with_count(offset).write(port)?;
     for _ in 1..SUBPACKET_PER_ACK {
         write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCG, &read_buf[..count])?;
-        offset += u32::try_from(count).map_err(|_| {
-            Error::Marshal(MarshalError::CapacityExceeded("write_zdata::offset", count))
-        })?;
+        offset += u32::try_from(count).map_err(|_| Error::OutOfMemory)?;
         count = file.read(read_buf)? as usize;
         if count < read_buf.len() {
             break;
@@ -916,21 +900,12 @@ where
     F: Write + ?Sized,
 {
     loop {
-        let zcrc = match read_subpacket(port, &mut state.buf, encoding) {
-            Ok(zcrc) => zcrc,
-            Err(Error::Unmarshal(_)) => {
-                ZNAK_HEADER.with_count(state.count).write(port)?;
-                continue;
-            }
-            Err(err) => return Err(err),
+        let Ok(zcrc) = read_subpacket(port, &mut state.buf, encoding) else {
+            ZNAK_HEADER.with_count(state.count).write(port)?;
+            continue;
         };
         file.write_all(&state.buf)?;
-        state.count += u32::try_from(state.buf.len()).map_err(|_| {
-            Error::Marshal(MarshalError::CapacityExceeded(
-                "read_zdata::count",
-                state.buf.len(),
-            ))
-        })?;
+        state.count += u32::try_from(state.buf.len()).map_err(|_| Error::OutOfMemory)?;
         match zcrc {
             Packet::ZCRCW => {
                 ZACK_HEADER.with_count(state.count).write(port)?;
@@ -958,19 +933,21 @@ where
     P: Read + ?Sized,
 {
     loop {
-        loop {
-            if port.read_byte()? == ZPAD {
-                break;
-            }
+        let b = port.read_byte()?;
+        if b != ZPAD {
+            continue;
         }
 
-        let mut b = port.read_byte()?;
-        if b == ZPAD {
-            b = port.read_byte()?;
-        }
-
+        let b = port.read_byte()?;
         if b == ZDLE {
             return Ok(());
+        }
+
+        if b == ZPAD {
+            let b = port.read_byte()?;
+            if b == ZDLE {
+                return Ok(());
+            }
         }
     }
 }
@@ -999,16 +976,13 @@ where
         if byte == ZDLE {
             let byte = port.read_byte()?;
             if let Ok(packet) = Packet::try_from(byte) {
-                buf.push(packet as u8).map_err(|_| {
-                    UnmarshalError::CapacityExceeded("read_subpacket", buf.capacity())
-                })?;
+                buf.push(packet as u8).map_err(|_| Error::OutOfMemory)?;
                 break packet;
             }
             buf.push(zdle::UNZDLE_TABLE[byte as usize])
-                .map_err(|_| UnmarshalError::CapacityExceeded("read_subpacket", buf.capacity()))?;
+                .map_err(|_| Error::OutOfMemory)?;
         } else {
-            buf.push(byte)
-                .map_err(|_| UnmarshalError::CapacityExceeded("read_subpacket", buf.capacity()))?;
+            buf.push(byte).map_err(|_| Error::OutOfMemory)?;
         }
 
         if buf.len() == buf.capacity() {
@@ -1025,8 +999,7 @@ where
     }
     check_crc(buf, &crc[..crc_len], encoding)?;
 
-    buf.pop()
-        .ok_or(Error::Unmarshal(UnmarshalError::MalformedHeader))?;
+    buf.pop().ok_or(Error::MalformedHeader)?;
     Ok(result)
 }
 
@@ -1075,12 +1048,10 @@ where
     match encoding {
         Encoding::ZBIN32 => {
             let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
-            crc_buf.extend_from_slice(data).map_err(|_| {
-                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
-            })?;
-            crc_buf.push(kind).map_err(|_| {
-                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
-            })?;
+            crc_buf
+                .extend_from_slice(data)
+                .map_err(|_| Error::OutOfMemory)?;
+            crc_buf.push(kind).map_err(|_| Error::OutOfMemory)?;
 
             let mut buf = [0u8; 4];
             let crc = crc::crc32_iso_hdlc(&crc_buf).to_le_bytes();
@@ -1089,21 +1060,17 @@ where
         }
         Encoding::ZBIN => {
             let mut crc_buf: Buffer<SUBPACKET_CRC_MAX_SIZE> = Buffer::new();
-            crc_buf.extend_from_slice(data).map_err(|_| {
-                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
-            })?;
-            crc_buf.push(kind).map_err(|_| {
-                MarshalError::CapacityExceeded("write_subpacket", crc_buf.capacity())
-            })?;
+            crc_buf
+                .extend_from_slice(data)
+                .map_err(|_| Error::OutOfMemory)?;
+            crc_buf.push(kind).map_err(|_| Error::OutOfMemory)?;
 
             let mut buf = [0u8; 2];
             let crc = crc::crc16_xmodem(&crc_buf).to_be_bytes();
             buf.copy_from_slice(&crc);
             write_slice_escaped(port, &buf)
         }
-        Encoding::ZHEX => {
-            unimplemented!()
-        }
+        Encoding::ZHEX => Err(Error::Unsupported),
     }
 }
 
@@ -1113,9 +1080,9 @@ fn check_crc(data: &[u8], crc: &[u8], encoding: Encoding) -> Result<(), Error> {
     if *crc == crc2[..crc2_len] {
         Ok(())
     } else if encoding == Encoding::ZBIN32 {
-        Err(UnmarshalError::Crc32Mismatch.into())
+        Err(Error::UnexpectedCrc32)
     } else {
-        Err(UnmarshalError::Crc16Mismatch.into())
+        Err(Error::UnexpectedCrc16)
     }
 }
 

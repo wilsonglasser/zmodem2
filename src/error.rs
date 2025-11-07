@@ -4,28 +4,9 @@
 use crate::String;
 use thiserror::Error;
 
-/// I/O errors.
+/// Top-level error type.
 #[derive(Error, Debug, PartialEq)]
-pub enum IoError {
-    #[error("read: {0}")]
-    Read(String),
-    #[error("write: {0}")]
-    Write(String),
-    #[error("I/O operation would block")]
-    WouldBlock,
-    #[error("not connected")]
-    NotConnected,
-}
-
-/// Protocol unmarshalling (parsing) errors.
-#[derive(Error, Debug, PartialEq)]
-pub enum UnmarshalError {
-    #[error("{0}: unmarshal buffer capacity {1} exceeded")]
-    CapacityExceeded(&'static str, usize),
-    #[error("CRC-16 mismatch")]
-    Crc16Mismatch,
-    #[error("CRC-32 mismatch")]
-    Crc32Mismatch,
+pub enum Error {
     #[error("malformed encoding type: {0:#02x}")]
     MalformedEncoding(u8),
     #[error("malformed file size")]
@@ -38,24 +19,22 @@ pub enum UnmarshalError {
     MalformedHeader,
     #[error("malformed packet type: {0:#02x}")]
     MalformedPacket(u8),
-}
-
-/// Protocol marshalling (formatting) errors.
-#[derive(Error, Debug, PartialEq)]
-pub enum MarshalError {
-    #[error("{0}: marshal buffer capacity {1} exceeded")]
-    CapacityExceeded(&'static str, usize),
-    #[error("file is truncated")]
-    FileTruncated,
-}
-
-/// Main error type for the zmodem2 library.
-#[derive(Error, Debug, PartialEq)]
-pub enum Error {
-    #[error(transparent)]
-    Io(#[from] IoError),
-    #[error(transparent)]
-    Marshal(#[from] MarshalError),
-    #[error(transparent)]
-    Unmarshal(#[from] UnmarshalError),
+    #[error("not connected")]
+    NotConnected,
+    #[error("read: {0}")]
+    Read(String),
+    #[error("out of memory")]
+    OutOfMemory,
+    #[error("unexpected CRC-16")]
+    UnexpectedCrc16,
+    #[error("unexpected CRC-32")]
+    UnexpectedCrc32,
+    #[error("unexpected EOF")]
+    UnexpectedEof,
+    #[error("unsupported operation")]
+    Unsupported,
+    #[error("would block")]
+    WouldBlock,
+    #[error("write: {0}")]
+    Write(String),
 }

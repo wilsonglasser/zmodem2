@@ -94,8 +94,8 @@ impl<R: Read, W: Write> Write for MockPort<R, W> {
 fn create_test_file(path: &Path, size_bytes: usize) {
     let mut file = File::create(path).unwrap();
     let mut buffer = [0u8; 1024];
-    for i in 0..buffer.len() {
-        buffer[i] = (i % 256) as u8;
+    for (i, byte) in buffer.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
     }
 
     let mut bytes_written = 0;
@@ -207,7 +207,7 @@ fn setup_rz(dest_dir: &TempDir) -> (Child, MockPort<ChildStdout, ChildStdin>) {
 }
 
 #[test]
-#[cfg(all(host_has_rzsz))]
+#[cfg(host_has_rzsz)]
 fn test_batch_from_sz() {
     let test_files = TestFiles::new();
     let dest_dir = tempfile::Builder::new()
@@ -272,7 +272,7 @@ fn test_batch_from_sz() {
 }
 
 #[test]
-#[cfg(all(host_has_rzsz))]
+#[cfg(host_has_rzsz)]
 fn test_batch_to_rz() {
     let test_files = TestFiles::new();
     let dest_dir = tempfile::Builder::new()
@@ -327,9 +327,6 @@ fn test_batch_to_rz() {
             Ok(Poll::Ready) => {}
             Ok(Poll::Pending) => {
                 sleep(Duration::from_millis(50));
-            }
-            Err(zmodem2::Error::Io(_)) => {
-                break;
             }
             Err(e) => panic!("finish failed: {e}"),
         }

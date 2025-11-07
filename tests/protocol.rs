@@ -4,7 +4,7 @@
 
 use core::cmp;
 use rstest::rstest;
-use zmodem2::{Encoding, Error, Frame, Header, IoError, Poll, Read, State, Write, XON, ZDLE, ZPAD};
+use zmodem2::{Encoding, Error, Frame, Header, Poll, Read, State, Write, XON, ZDLE, ZPAD};
 
 struct MockPort<'a> {
     input: &'a [u8],
@@ -23,7 +23,7 @@ impl<'a> MockPort<'a> {
 impl<'a> Read for MockPort<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<u32, Error> {
         if self.input.is_empty() {
-            return Err(IoError::WouldBlock.into());
+            return Err(Error::WouldBlock);
         }
         let n = cmp::min(self.input.len(), buf.len());
         buf[..n].copy_from_slice(&self.input[..n]);
@@ -36,7 +36,7 @@ impl<'a> Read for MockPort<'a> {
             self.input = rest;
             Ok(first)
         } else {
-            Err(IoError::WouldBlock.into())
+            Err(Error::WouldBlock)
         }
     }
 }
