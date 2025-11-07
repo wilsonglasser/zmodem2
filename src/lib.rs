@@ -38,7 +38,6 @@ use core::{
     convert::TryFrom,
     fmt,
     ops::{Deref, DerefMut},
-    str::FromStr,
 };
 use strum::EnumIter;
 use strum::IntoEnumIterator;
@@ -779,6 +778,26 @@ fn u32_to_ascii_bytes(mut value: u32, buf: &mut [u8; U32_ASCII_MAX]) -> &[u8] {
     &buf[index..]
 }
 
+/// Parses a u32 from a slice of ASCII decimal bytes.
+fn parse_file_size(bytes: &[u8]) -> Result<u32, Error> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut result: u32 = 0;
+    for &byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            _ => return Err(Error::MalformedFileSize),
+        };
+        result = result
+            .checked_mul(10)
+            .and_then(|r| r.checked_add(digit))
+            .ok_or(Error::MalformedFileSize)?;
+    }
+    Ok(result)
+}
+
 /// Write ZRFILE
 fn write_zfile<P>(
     port: &mut P,
@@ -833,14 +852,7 @@ where
                     .next()
                     .unwrap_or_default();
 
-                if size_field_bytes.is_empty() {
-                    state.file_size = 0;
-                } else {
-                    let size_str = core::str::from_utf8(size_field_bytes)
-                        .map_err(|_| Error::MalformedFileSize)?;
-                    state.file_size =
-                        u32::from_str(size_str).map_err(|_| Error::MalformedFileSize)?;
-                }
+                state.file_size = parse_file_size(size_field_bytes)?;
             } else {
                 state.file_size = 0;
             }
