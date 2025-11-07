@@ -33,8 +33,6 @@ pub enum Error {
     UnexpectedEof,
     #[error("unsupported operation")]
     Unsupported,
-    #[error("would block")]
-    WouldBlock,
     #[error("write: {0}")]
     Write(String),
 }

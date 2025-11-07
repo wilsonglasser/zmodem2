@@ -174,15 +174,6 @@ impl fmt::Display for String {
     }
 }
 
-/// A result type for polling-based operations.
-#[derive(Debug, PartialEq)]
-pub enum Poll {
-    /// The operation has completed a step.
-    Ready,
-    /// The operation is not yet complete as it would block.
-    Pending,
-}
-
 /// Data structure for holding a ZMODEM protocol header, which begins a frame,
 /// and is followed optionally by a variable number of subpackets.
 #[repr(C)]
