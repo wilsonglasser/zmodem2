@@ -800,29 +800,6 @@ where
     Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0, 0, 0, zrinit.bits()]).write(port)
 }
 
-/// Converts a u32 to its ASCII byte representation.
-///
-/// This function writes the ASCII digits of `value` into `buf` from right to
-/// left and returns a slice pointing to the written digits.
-///
-/// Example: `value = 123`, `buf = [0u8; 10]`
-/// -> `buf` becomes `[..., 0, 0, 0, 0, 1, 2, 3]`
-/// -> returns `&[1, 2, 3]`
-fn u32_to_ascii_bytes(mut value: u32, buf: &mut [u8; U32_ASCII_MAX]) -> &[u8] {
-    if value == 0 {
-        buf[U32_ASCII_MAX - 1] = b'0';
-        return &buf[U32_ASCII_MAX - 1..];
-    }
-
-    let mut index = U32_ASCII_MAX;
-    while value > 0 {
-        index -= 1;
-        buf[index] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    &buf[index..]
-}
-
 /// Parses a u32 from a slice of ASCII decimal bytes.
 fn parse_file_size(bytes: &[u8]) -> Result<u32, Error> {
     if bytes.is_empty() {
@@ -848,18 +825,32 @@ fn write_zfile<P>(
     port: &mut P,
     buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
     name: &[u8],
-    size: u32,
+    mut size: u32,
 ) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
-    let mut size_buf = [0u8; U32_ASCII_MAX];
-    let size_bytes = u32_to_ascii_bytes(size, &mut size_buf);
-
     buf.clear();
     buf.extend_from_slice(name)
         .map_err(|_| Error::OutOfMemory)?;
     buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
+
+    let mut size_buf = [0u8; U32_ASCII_MAX];
+    let size_bytes = {
+        if size == 0 {
+            size_buf[U32_ASCII_MAX - 1] = b'0';
+            &size_buf[U32_ASCII_MAX - 1..]
+        } else {
+            let mut index = U32_ASCII_MAX;
+            while size > 0 {
+                index -= 1;
+                size_buf[index] = b'0' + (size % 10) as u8;
+                size /= 10;
+            }
+            &size_buf[index..]
+        }
+    };
+
     buf.extend_from_slice(size_bytes)
         .map_err(|_| Error::OutOfMemory)?;
     buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
