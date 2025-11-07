@@ -7,7 +7,7 @@ pub const fn crc16_xmodem(data: &[u8]) -> u16 {
     let mut crc: u16 = 0x0000;
     let mut i = 0;
     while i < data.len() {
-        let mut byte = data[i];
+        crc ^= (data[i] as u16) << 8;
         let mut j = 0;
         while j < 8 {
             if (crc & 0x8000) != 0 {
@@ -15,10 +15,6 @@ pub const fn crc16_xmodem(data: &[u8]) -> u16 {
             } else {
                 crc <<= 1;
             }
-            if (byte & 0x80) != 0 {
-                crc ^= 0x1021;
-            }
-            byte <<= 1;
             j += 1;
         }
         i += 1;
