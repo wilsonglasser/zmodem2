@@ -19,6 +19,14 @@ const HEADER_SIZE: usize = 32;
 /// The size of the header payload (frame type + flags).
 const HEADER_PAYLOAD_SIZE: usize = 5;
 
+pub(crate) const ZACK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZACK, &[0; 4]);
+pub(crate) const ZDATA_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZDATA, &[0; 4]);
+pub(crate) const ZEOF_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZEOF, &[0; 4]);
+pub(crate) const ZFIN_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZFIN, &[0; 4]);
+pub(crate) const ZNAK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZNAK, &[0; 4]);
+pub(crate) const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, &[0; 4]);
+pub(crate) const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 4]);
+
 /// Data structure for holding a ZMODEM protocol header, which begins a frame,
 /// and is followed optionally by a variable number of subpackets.
 #[repr(C)]
