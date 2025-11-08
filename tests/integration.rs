@@ -221,8 +221,8 @@ fn test_batch_from_sz() {
     let mut sink = std::io::sink();
     let mut current_file_name_bytes: Vec<u8> = Vec::new();
 
-    while state.stage() != State::SessionEnd {
-        if state.stage() == State::FileBegin
+    while state.state() != State::SessionEnd {
+        if state.state() == State::FileBegin
             && state.file_name() != current_file_name_bytes.as_slice()
         {
             let filename_bytes = state.file_name();
@@ -296,8 +296,8 @@ fn test_batch_to_rz() {
     let first_size = first_path.metadata().unwrap().len() as u32;
     let mut state = Transmission::set_first_file(first_filename, first_size).unwrap();
 
-    'send_loop: while state.stage() != State::SessionEnd {
-        if state.stage() == State::FileEnd {
+    'send_loop: while state.state() != State::SessionEnd {
+        if state.state() == State::FileEnd {
             if let Some(next_path) = file_iter.next() {
                 let next_filename = next_path.file_name().unwrap().to_str().unwrap();
                 let next_size = next_path.metadata().unwrap().len() as u32;
@@ -322,7 +322,7 @@ fn test_batch_to_rz() {
         }
     }
 
-    while state.stage() != State::SessionEnd {
+    while state.state() != State::SessionEnd {
         match state.finish(&mut port) {
             Ok(Some(())) => continue,
             Ok(None) => {

@@ -59,7 +59,7 @@ enum SubpacketState {
 
 /// Send or receive transmission state
 pub struct Transmission {
-    stage: State,
+    state: State,
     count: u32,
     file_name: String,
     file_size: u32,
@@ -83,7 +83,7 @@ impl Transmission {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            stage: State::SessionBegin,
+            state: State::SessionBegin,
             count: 0,
             file_name: String::new(),
             file_size: 0,
@@ -126,13 +126,13 @@ impl Transmission {
             .map_err(|_| Error::OutOfMemory)?;
         self.file_size = file_size;
         self.count = 0;
-        self.stage = State::FileEnd;
+        self.state = State::FileEnd;
         Ok(())
     }
 
     #[must_use]
-    pub fn stage(&self) -> State {
-        self.stage
+    pub fn state(&self) -> State {
+        self.state
     }
 
     #[must_use]
@@ -162,17 +162,17 @@ impl Transmission {
         P: Read + Write + ?Sized,
         F: Read + Seek + ?Sized,
     {
-        if self.stage == State::SessionBegin {
+        if self.state == State::SessionBegin {
             if ZRQINIT_HEADER.write(port)?.is_none() {
                 return Ok(None);
             }
-            self.stage = State::SessionSyncing;
+            self.state = State::SessionSyncing;
             return Ok(Some(()));
-        } else if self.stage == State::FileEnd {
+        } else if self.state == State::FileEnd {
             if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none() {
                 return Ok(None);
             }
-            self.stage = State::FileBegin;
+            self.state = State::FileBegin;
             return Ok(Some(()));
         }
 
@@ -193,32 +193,32 @@ impl Transmission {
 
         match header.frame() {
             Frame::ZRINIT => {
-                if self.stage == State::SessionSyncing {
+                if self.state == State::SessionSyncing {
                     if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none()
                     {
                         return Ok(None);
                     }
-                    self.stage = State::FileBegin;
-                } else if self.stage == State::FileWaitingSubpacket {
-                    self.stage = State::FileEnd;
+                    self.state = State::FileBegin;
+                } else if self.state == State::FileWaitingSubpacket {
+                    self.state = State::FileEnd;
                 }
             }
             Frame::ZRPOS | Frame::ZACK => {
-                if self.stage == State::SessionSyncing {
+                if self.state == State::SessionSyncing {
                     if ZRQINIT_HEADER.write(port)?.is_none() {
                         return Ok(None);
                     }
-                } else if self.stage == State::FileBegin
-                    || self.stage == State::FileWaitingSubpacket
+                } else if self.state == State::FileBegin
+                    || self.state == State::FileWaitingSubpacket
                 {
                     if write_zdata(port, file, header.count())?.is_none() {
                         return Ok(None);
                     }
-                    self.stage = State::FileWaitingSubpacket;
+                    self.state = State::FileWaitingSubpacket;
                 }
             }
             _ => {
-                if self.stage == State::SessionSyncing && ZRQINIT_HEADER.write(port)?.is_none() {
+                if self.state == State::SessionSyncing && ZRQINIT_HEADER.write(port)?.is_none() {
                     return Ok(None);
                 }
             }
@@ -238,22 +238,22 @@ impl Transmission {
         P: Read + Write + ?Sized,
         F: Write + ?Sized,
     {
-        if self.stage == State::FileReadingSubpacket {
+        if self.state == State::FileReadingSubpacket {
             return self.receive_subpacket(port, file);
         }
-        if self.stage == State::FileReadingMetadata {
+        if self.state == State::FileReadingMetadata {
             return self.receive_subpacket_metadata(port);
         }
 
-        if self.stage == State::SessionBegin && write_zrinit(port)?.is_none() {
+        if self.state == State::SessionBegin && write_zrinit(port)?.is_none() {
             return Ok(None);
         }
 
         let read_zpad_result = read_zpad(port);
         let Some(()) = (match read_zpad_result {
             Err(Error::Read(err)) => {
-                if self.stage == State::FileBegin {
-                    self.stage = State::SessionEnd;
+                if self.state == State::FileBegin {
+                    self.state = State::SessionEnd;
                     return Ok(Some(()));
                 }
                 Err(Error::Read(err))
@@ -268,8 +268,8 @@ impl Transmission {
             Ok(Some(header)) => header,
             Ok(None) => return Ok(None),
             Err(Error::Read(err)) => {
-                if self.stage == State::FileBegin {
-                    self.stage = State::SessionEnd;
+                if self.state == State::FileBegin {
+                    self.state = State::SessionEnd;
                     return Ok(Some(()));
                 }
                 return Err(Error::Read(err));
@@ -284,9 +284,9 @@ impl Transmission {
 
         match header.frame() {
             Frame::ZFILE => {
-                if self.stage == State::SessionBegin || self.stage == State::FileBegin {
+                if self.state == State::SessionBegin || self.state == State::FileBegin {
                     self.data_encoding = header.encoding();
-                    self.stage = State::FileReadingMetadata;
+                    self.state = State::FileReadingMetadata;
                     self.subpacket_state = SubpacketState::Data;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
@@ -294,12 +294,12 @@ impl Transmission {
                 }
             }
             Frame::ZDATA => {
-                if self.stage == State::SessionBegin {
+                if self.state == State::SessionBegin {
                     if write_zrinit(port)?.is_none() {
                         return Ok(None);
                     }
-                } else if self.stage == State::FileBegin
-                    || self.stage == State::FileWaitingSubpacket
+                } else if self.state == State::FileBegin
+                    || self.state == State::FileWaitingSubpacket
                 {
                     if header.count() != self.count {
                         if ZRPOS_HEADER.with_count(self.count).write(port)?.is_none() {
@@ -308,7 +308,7 @@ impl Transmission {
                         return Ok(Some(()));
                     }
                     self.data_encoding = header.encoding();
-                    self.stage = State::FileReadingSubpacket;
+                    self.state = State::FileReadingSubpacket;
                     self.subpacket_state = SubpacketState::Data;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
@@ -316,19 +316,19 @@ impl Transmission {
                 }
             }
             Frame::ZEOF => {
-                if self.stage == State::FileWaitingSubpacket && header.count() == self.count {
+                if self.state == State::FileWaitingSubpacket && header.count() == self.count {
                     if write_zrinit(port)?.is_none() {
                         return Ok(None);
                     }
-                    self.stage = State::FileBegin;
+                    self.state = State::FileBegin;
                 }
             }
             Frame::ZFIN => {
-                if self.stage == State::FileWaitingSubpacket || self.stage == State::FileBegin {
+                if self.state == State::FileWaitingSubpacket || self.state == State::FileBegin {
                     if ZFIN_HEADER.write(port)?.is_none() {
                         return Ok(None);
                     }
-                    self.stage = State::SessionEnd;
+                    self.state = State::SessionEnd;
                 }
             }
             _ => {}
@@ -368,7 +368,7 @@ impl Transmission {
         Ok(())
     }
 
-    /// Handles reading a single byte for the `SubpacketState::Data` stage.
+    /// Handles reading a single byte for the `SubpacketState::Data` state.
     fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
@@ -455,7 +455,7 @@ impl Transmission {
                     return Ok(None);
                 }
 
-                self.stage = State::FileBegin;
+                self.state = State::FileBegin;
                 self.subpacket_state = SubpacketState::Idle;
                 Ok(Some(()))
             }
@@ -519,7 +519,7 @@ impl Transmission {
                         self.subpacket_state = SubpacketState::Data;
                     }
                     SubpacketType::ZCRCE => {
-                        self.stage = State::FileWaitingSubpacket;
+                        self.state = State::FileWaitingSubpacket;
                         self.subpacket_state = SubpacketState::Idle;
                     }
                 }
@@ -540,11 +540,11 @@ impl Transmission {
     where
         P: Read + Write + ?Sized,
     {
-        if self.stage != State::SessionTeardown {
+        if self.state != State::SessionTeardown {
             if ZFIN_HEADER.write(port)?.is_none() {
                 return Ok(None);
             }
-            self.stage = State::SessionTeardown;
+            self.state = State::SessionTeardown;
             return Ok(Some(()));
         }
 
@@ -571,7 +571,7 @@ impl Transmission {
                 if port.write_byte(b'O')?.is_none() {
                     return Ok(None);
                 }
-                self.stage = State::SessionEnd;
+                self.state = State::SessionEnd;
             }
             _ => {
                 if ZFIN_HEADER.write(port)?.is_none() {
