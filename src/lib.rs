@@ -63,18 +63,18 @@ const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
-pub enum Packet {
+pub enum SubpacketType {
     ZCRCE = 0x68,
     ZCRCG = 0x69,
     ZCRCQ = 0x6a,
     ZCRCW = 0x6b,
 }
 
-impl TryFrom<u8> for Packet {
+impl TryFrom<u8> for SubpacketType {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Packet::iter()
+        SubpacketType::iter()
             .find(|e| value == *e as u8)
             .ok_or(Error::MalformedPacket(value))
     }
@@ -82,10 +82,10 @@ impl TryFrom<u8> for Packet {
 
 /// Internal state for reading a subpacket byte-by-byte
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Subpacket {
+enum SubpacketState {
     Idle,
     Data,
-    Crc(Packet),
+    Crc(SubpacketType),
 }
 
 /// Send or receive transmission state
@@ -96,7 +96,7 @@ pub struct Transmission {
     file_size: u32,
     buf: Buffer<SUBPACKET_MAX_SIZE>,
     data_encoding: Encoding,
-    subpacket: Subpacket,
+    subpacket_state: SubpacketState,
     crc_calculator_16: crc::Crc16,
     crc_calculator_32: crc::Crc32,
     crc_bytes_read: u8,
@@ -120,7 +120,7 @@ impl Transmission {
             file_size: 0,
             buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
             data_encoding: Encoding::ZBIN,
-            subpacket: Subpacket::Idle,
+            subpacket_state: SubpacketState::Idle,
             crc_calculator_16: crc::Crc16::new(),
             crc_calculator_32: crc::Crc32::new(),
             crc_bytes_read: 0,
@@ -318,7 +318,7 @@ impl Transmission {
                 if self.stage == State::SessionBegin || self.stage == State::FileBegin {
                     self.data_encoding = header.encoding();
                     self.stage = State::FileReadingMetadata;
-                    self.subpacket = Subpacket::Data;
+                    self.subpacket_state = SubpacketState::Data;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
@@ -340,7 +340,7 @@ impl Transmission {
                     }
                     self.data_encoding = header.encoding();
                     self.stage = State::FileReadingSubpacket;
-                    self.subpacket = Subpacket::Data;
+                    self.subpacket_state = SubpacketState::Data;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
@@ -399,7 +399,7 @@ impl Transmission {
         Ok(())
     }
 
-    /// Handles reading a single byte for the `Subpacket::Data` stage.
+    /// Handles reading a single byte for the `SubpacketState::Data` stage.
     fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
@@ -412,13 +412,13 @@ impl Transmission {
             let Some(byte) = port.read_byte()? else {
                 return Ok(None);
             };
-            if let Ok(packet) = Packet::try_from(byte) {
+            if let Ok(packet) = SubpacketType::try_from(byte) {
                 if self.data_encoding == Encoding::ZBIN32 {
                     self.crc_calculator_32.update_byte(packet as u8);
                 } else {
                     self.crc_calculator_16.update_byte(packet as u8);
                 }
-                self.subpacket = Subpacket::Crc(packet);
+                self.subpacket_state = SubpacketState::Crc(packet);
                 self.crc_bytes_read = 0;
                 self.crc_buf = [0; 4];
             } else {
@@ -446,9 +446,9 @@ impl Transmission {
     where
         P: Read + Write + ?Sized,
     {
-        match self.subpacket {
-            Subpacket::Data => self.receive_subpacket_data_byte(port),
-            Subpacket::Crc(_) => {
+        match self.subpacket_state {
+            SubpacketState::Data => self.receive_subpacket_data_byte(port),
+            SubpacketState::Crc(_) => {
                 let crc_len = if self.data_encoding == Encoding::ZBIN32 {
                     4
                 } else {
@@ -487,10 +487,10 @@ impl Transmission {
                 }
 
                 self.stage = State::FileBegin;
-                self.subpacket = Subpacket::Idle;
+                self.subpacket_state = SubpacketState::Idle;
                 Ok(Some(()))
             }
-            Subpacket::Idle => Err(Error::Unsupported),
+            SubpacketState::Idle => Err(Error::Unsupported),
         }
     }
 
@@ -500,9 +500,9 @@ impl Transmission {
         P: Read + Write + ?Sized,
         F: Write + ?Sized,
     {
-        match self.subpacket {
-            Subpacket::Data => self.receive_subpacket_data_byte(port),
-            Subpacket::Crc(packet) => {
+        match self.subpacket_state {
+            SubpacketState::Data => self.receive_subpacket_data_byte(port),
+            SubpacketState::Crc(packet) => {
                 let crc_len = if self.data_encoding == Encoding::ZBIN32 {
                     4
                 } else {
@@ -540,23 +540,23 @@ impl Transmission {
                 self.crc_calculator_32 = crc::Crc32::new();
 
                 match packet {
-                    Packet::ZCRCW | Packet::ZCRCQ => {
+                    SubpacketType::ZCRCW | SubpacketType::ZCRCQ => {
                         if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
                             return Ok(None);
                         }
-                        self.subpacket = Subpacket::Data;
+                        self.subpacket_state = SubpacketState::Data;
                     }
-                    Packet::ZCRCG => {
-                        self.subpacket = Subpacket::Data;
+                    SubpacketType::ZCRCG => {
+                        self.subpacket_state = SubpacketState::Data;
                     }
-                    Packet::ZCRCE => {
+                    SubpacketType::ZCRCE => {
                         self.stage = State::FileWaitingSubpacket;
-                        self.subpacket = Subpacket::Idle;
+                        self.subpacket_state = SubpacketState::Idle;
                     }
                 }
                 Ok(Some(()))
             }
-            Subpacket::Idle => Err(Error::Unsupported),
+            SubpacketState::Idle => Err(Error::Unsupported),
         }
     }
 
@@ -698,7 +698,7 @@ where
     {
         return Ok(None);
     }
-    write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, buf)
+    write_subpacket(port, Encoding::ZBIN32, SubpacketType::ZCRCW, buf)
 }
 
 /// Writes ZDATA
@@ -731,7 +731,14 @@ where
         return Ok(None);
     }
     for _ in 1..SUBPACKET_PER_ACK {
-        if write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCG, &read_buf[..count])?.is_none() {
+        if write_subpacket(
+            port,
+            Encoding::ZBIN32,
+            SubpacketType::ZCRCG,
+            &read_buf[..count],
+        )?
+        .is_none()
+        {
             return Ok(None);
         }
         offset += u32::try_from(count).map_err(|_| Error::OutOfMemory)?;
@@ -744,7 +751,12 @@ where
             break;
         }
     }
-    write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, &read_buf[..count])
+    write_subpacket(
+        port,
+        Encoding::ZBIN32,
+        SubpacketType::ZCRCW,
+        &read_buf[..count],
+    )
 }
 
 /// Skips (ZPAD, [ZPAD,] ZDLE) sequence.
@@ -793,7 +805,7 @@ where
 fn write_subpacket<P>(
     port: &mut P,
     encoding: Encoding,
-    kind: Packet,
+    kind: SubpacketType,
     data: &[u8],
 ) -> Result<Option<()>, Error>
 where

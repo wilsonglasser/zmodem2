@@ -2,7 +2,7 @@
 // Copyright (c) 2017-2020 Alexey Arbuzov
 // Copyright (c) 2023-2025 Jarkko Sakkinen
 
-use super::{Encoding, Error, Frame, Header, Packet, Read, Seek, String, Write};
+use super::{Encoding, Error, Frame, Header, Read, Seek, String, SubpacketType, Write};
 use std::{fmt, io::SeekFrom};
 
 impl<W> Write for W
@@ -98,7 +98,7 @@ impl fmt::Display for Frame {
     }
 }
 
-impl fmt::Display for Packet {
+impl fmt::Display for SubpacketType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:#0x}", *self as u8)
     }
