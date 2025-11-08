@@ -4,7 +4,7 @@
 
 use core::cmp;
 use rstest::rstest;
-use zmodem2::{Encoding, Error, Frame, Header, Read, State, Write, XON, ZDLE, ZPAD};
+use zmodem2::{Encoding, Error, Frame, Header, Read, Transmission, Write, XON, ZDLE, ZPAD};
 
 struct MockPort<'a> {
     input: &'a [u8],
@@ -90,7 +90,7 @@ pub fn test_header_read(
 fn test_receive_malformed_header() {
     let mut mock_port = MockPort::new(b"malformed data");
     let mut file = vec![];
-    let mut state = State::new();
+    let mut state = Transmission::new();
 
     let result = state.receive(&mut mock_port, &mut file);
     assert!(matches!(result, Ok(None)));

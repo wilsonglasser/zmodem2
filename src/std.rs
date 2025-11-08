@@ -82,7 +82,7 @@ where
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:8} {}", self.encoding, self.frame)
+        write!(f, "{:8} {}", self.encoding(), self.frame())
     }
 }
 

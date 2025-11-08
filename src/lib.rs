@@ -7,9 +7,7 @@
 //! with the ZMODEM protocol. Each step corresponds to a single ZMODEM frame
 //! transaction, and the state between the calls is kept in a `zmodem2::State`
 //! instance.
-//!
 //! The usage can be described in the high-level with the following flow:
-//!
 //! 1. Create `zmodem2::State`.
 //! 2. Call either `state.send(...)` or `state.receive(...)`.
 //! 3. If the returned `zmodem2::Stage` is not yet `zmodem2::Stage::FileEnd`,
@@ -23,22 +21,19 @@
 mod buffer;
 mod crc;
 mod error;
+mod header;
 mod io;
 #[cfg(feature = "std")]
 mod std;
+mod string;
 mod zdle;
 
 pub use buffer::*;
 pub use error::*;
+pub use header::*;
 pub use io::*;
+pub use string::*;
 
-use bitflags::bitflags;
-use core::{
-    cmp::min,
-    convert::TryFrom,
-    fmt,
-    ops::{Deref, DerefMut},
-};
 use strum::EnumIter;
 use strum::IntoEnumIterator;
 
@@ -46,17 +41,11 @@ use strum::IntoEnumIterator;
 /// original ZMODEM specification.
 const SUBPACKET_MAX_SIZE: usize = 1024;
 
-/// Buffer size with enough capacity for an escaped header
-const HEADER_SIZE: usize = 32;
-
 /// The number of subpackets to stream
 const SUBPACKET_PER_ACK: usize = 10;
 
 /// Maximum number of bytes to represent a u32 as ASCII.
 const U32_ASCII_MAX: usize = 10;
-
-/// The capacity of the fixed-size `String` type.
-const STRING_CAP: usize = 256;
 
 pub const ZPAD: u8 = b'*';
 pub const ZDLE: u8 = 0x18;
@@ -69,372 +58,6 @@ const ZFIN_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZFIN, &[0; 4]);
 const ZNAK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZNAK, &[0; 4]);
 const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, &[0; 4]);
 const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 4]);
-
-/// A stack-allocated, fixed-capacity string.
-///
-/// This is a newtype wrapper around `Buffer<256>` to provide type safety and
-/// string-specific operations.
-#[derive(Eq)]
-pub struct String(Buffer<STRING_CAP>);
-
-impl Default for String {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl From<&str> for String {
-    /// Creates a new `String` from a `&str`, truncating if necessary.
-    fn from(s: &str) -> Self {
-        let mut string = Self::new();
-        let bytes = s.as_bytes();
-        let len = min(bytes.len(), STRING_CAP);
-        let mut end = len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-
-        let truncated_bytes = &bytes[..end];
-        string
-            .extend_from_slice(truncated_bytes)
-            .unwrap_or_default();
-        string
-    }
-}
-
-impl String {
-    /// Creates a new, empty string.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self(Buffer::<STRING_CAP>::new())
-    }
-
-    /// Resets buffer length back to zero.
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    /// Returns the capacity of the buffer in bytes.
-    #[must_use]
-    pub const fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-
-    /// Copies bytes from a slice to the end of the buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(CapacityError)`, if the capacity would be exceeded.
-    pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), CapacityError> {
-        self.0.extend_from_slice(slice)
-    }
-}
-
-impl Deref for String {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for String {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl AsRef<[u8]> for String {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl<T: ?Sized> PartialEq<T> for String
-where
-    T: AsRef<[u8]>,
-{
-    fn eq(&self, other: &T) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl fmt::Debug for String {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match core::str::from_utf8(&self.0) {
-            Ok(s) => f.write_str(s),
-            Err(_) => f.debug_list().entries(self.0.iter()).finish(),
-        }
-    }
-}
-
-impl fmt::Display for String {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(core::str::from_utf8(&self.0).unwrap_or(""))
-    }
-}
-
-/// Data structure for holding a ZMODEM protocol header, which begins a frame,
-/// and is followed optionally by a variable number of subpackets.
-#[repr(C)]
-#[derive(PartialEq)]
-pub struct Header {
-    encoding: Encoding,
-    frame: Frame,
-    flags: [u8; 4],
-}
-
-impl Header {
-    /// Creates a new instance
-    #[must_use]
-    pub const fn new(encoding: Encoding, frame: Frame, flags: &[u8; 4]) -> Self {
-        Self {
-            encoding,
-            frame,
-            flags: *flags,
-        }
-    }
-
-    /// Returns `Encoding` of the frame
-    #[must_use]
-    pub const fn encoding(&self) -> Encoding {
-        self.encoding
-    }
-
-    /// Returns `Frame`, containing the frame type
-    #[must_use]
-    pub const fn frame(&self) -> Frame {
-        self.frame
-    }
-
-    /// Returns count for the frame types using this field
-    #[must_use]
-    pub const fn count(&self) -> u32 {
-        u32::from_le_bytes(self.flags)
-    }
-
-    /// Encodes and writes the header to the serial port
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn write<P>(&self, port: &mut P) -> Result<Option<()>, Error>
-    where
-        P: Write + ?Sized,
-    {
-        let mut out: Buffer<HEADER_SIZE> = Buffer::new();
-
-        if port.write_byte(ZPAD)?.is_none() {
-            return Ok(None);
-        }
-        if self.encoding == Encoding::ZHEX && port.write_byte(ZPAD)?.is_none() {
-            return Ok(None);
-        }
-        if port.write_byte(ZDLE)?.is_none() {
-            return Ok(None);
-        }
-        if port.write_byte(self.encoding as u8)?.is_none() {
-            return Ok(None);
-        }
-
-        out.push(self.frame as u8).map_err(|_| Error::OutOfMemory)?;
-        out.extend_from_slice(&self.flags)
-            .map_err(|_| Error::OutOfMemory)?;
-        let mut crc = [0u8; 4];
-        let crc_len = make_crc(&out, &mut crc, self.encoding);
-        out.extend_from_slice(&crc[..crc_len])
-            .map_err(|_| Error::OutOfMemory)?;
-
-        if self.encoding == Encoding::ZHEX {
-            let mut hex_buf = [0u8; HEADER_SIZE];
-            let len = out.len() * 2;
-            let hex = &mut hex_buf.get_mut(..len).ok_or(Error::UnexpectedEof)?;
-            hex::encode_to_slice(&out, hex).map_err(|_| Error::OutOfMemory)?;
-            if write_slice_escaped(port, hex)?.is_none() {
-                return Ok(None);
-            }
-        } else if write_slice_escaped(port, &out)?.is_none() {
-            return Ok(None);
-        }
-
-        if self.encoding == Encoding::ZHEX {
-            if port.write_byte(b'\r')?.is_none() {
-                return Ok(None);
-            }
-            if port.write_byte(b'\n')?.is_none() {
-                return Ok(None);
-            }
-            if self.frame != Frame::ZACK
-                && self.frame != Frame::ZFIN
-                && port.write_byte(XON)?.is_none()
-            {
-                return Ok(None);
-            }
-        }
-        Ok(Some(()))
-    }
-
-    /// Reads and decodes a header from the serial port, and returns a new
-    /// instance
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn read<P>(port: &mut P) -> Result<Option<Header>, Error>
-    where
-        P: Read + ?Sized,
-    {
-        let Some(encoding_byte) = port.read_byte()? else {
-            return Ok(None);
-        };
-        let encoding = Encoding::try_from(encoding_byte)?;
-
-        let mut out_hex: Buffer<HEADER_SIZE> = Buffer::new();
-        for _ in 0..Header::unescaped_size(encoding) - 1 {
-            let Some(byte) = read_byte_unescaped(port)? else {
-                return Ok(None);
-            };
-            out_hex.push(byte).map_err(|_| Error::OutOfMemory)?;
-        }
-
-        let mut out: Buffer<HEADER_SIZE> = Buffer::new();
-        if encoding == Encoding::ZHEX {
-            let mut out_bytes = [0u8; HEADER_SIZE / 2];
-            let out_len = out_hex.len() / 2;
-            hex::decode_to_slice(&out_hex, &mut out_bytes[..out_len])
-                .map_err(|_| Error::MalformedHeader)?;
-            out.extend_from_slice(&out_bytes[..out_len])
-                .map_err(|_| Error::OutOfMemory)?;
-        } else {
-            out.extend_from_slice(&out_hex)
-                .map_err(|_| Error::OutOfMemory)?;
-        }
-        check_crc(&out[..5], &out[5..], encoding)?;
-        let frame = Frame::try_from(out[0])?;
-        let mut header = Header::new(encoding, frame, &[0; 4]);
-        header.flags.copy_from_slice(&out[1..=4]);
-        Ok(Some(header))
-    }
-
-    /// Returns a new instance with the flags substitude with a count
-    /// for the frame types using this field.
-    #[must_use]
-    pub const fn with_count(&self, count: u32) -> Self {
-        Header::new(self.encoding, self.frame, &count.to_le_bytes())
-    }
-
-    /// Returns the serialized size of the header before escaping
-    const fn unescaped_size(encoding: Encoding) -> usize {
-        match encoding {
-            Encoding::ZBIN => core::mem::size_of::<Header>() + 2,
-            Encoding::ZBIN32 => core::mem::size_of::<Header>() + 4,
-            Encoding::ZHEX => (core::mem::size_of::<Header>() + 2) * 2 - 1,
-        }
-    }
-}
-
-/// The ZMODEM protocol frame encoding
-#[repr(u8)]
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
-pub enum Encoding {
-    ZBIN = 0x41,
-    ZHEX = 0x42,
-    ZBIN32 = 0x43,
-}
-
-impl TryFrom<u8> for Encoding {
-    type Error = Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Encoding::iter()
-            .find(|e| value == *e as u8)
-            .ok_or(Error::MalformedEncoding(value))
-    }
-}
-
-#[repr(u8)]
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
-/// Frame types
-pub enum Frame {
-    /// Request receive init
-    ZRQINIT = 0,
-    /// Receiver capabilities and packet size
-    ZRINIT = 1,
-    /// Send init sequence (optional)
-    ZSINIT = 2,
-    /// ACK to above
-    ZACK = 3,
-    /// File name from sender
-    ZFILE = 4,
-    /// To sender: skip this file
-    ZSKIP = 5,
-    /// Last packet was garbled
-    ZNAK = 6,
-    /// Abort batch transfers
-    ZABORT = 7,
-    /// Finish session
-    ZFIN = 8,
-    /// Resume data trans at this position
-    ZRPOS = 9,
-    /// Data packet(s) follow
-    ZDATA = 10,
-    /// End of file
-    ZEOF = 11,
-    /// Fatal Read or Write error Detected
-    ZFERR = 12,
-    /// Request for file CRC and response
-    ZCRC = 13,
-    /// Receiver's Challenge
-    ZCHALLENGE = 14,
-    /// Request is complete
-    ZCOMPL = 15,
-    /// Other end canned session with CAN*5
-    ZCAN = 16,
-    /// Request for free bytes on filesystem
-    ZFREECNT = 17,
-    /// Command from sending program
-    ZCOMMAND = 18,
-    /// Output to standard error, data follows
-    ZSTDERR = 19,
-}
-
-impl TryFrom<u8> for Frame {
-    type Error = Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Frame::iter()
-            .find(|t| value == *t as u8)
-            .ok_or(Error::MalformedFrame(value))
-    }
-}
-
-bitflags! {
-    /// `ZRINIT` flags
-    struct Zrinit: u8 {
-        /// Can send and receive in full-duplex
-        const CANFDX = 0x01;
-        /// Can receive data in parallel with disk I/O
-        const CANOVIO = 0x02;
-        /// Can send a break signal
-        const CANBRK = 0x04;
-        /// Can decrypt
-        const CANCRY = 0x08;
-        /// Can uncompress
-        const CANLZW = 0x10;
-        /// Can use 32-bit frame check
-        const CANFC32 = 0x20;
-        /// Expects control character to be escaped
-        const ESCCTL = 0x40;
-        /// Expects 8th bit to be escaped
-        const ESC8 = 0x80;
-    }
-}
 
 /// The ZMODEM protocol subpacket type
 #[repr(u8)]
@@ -457,31 +80,51 @@ impl TryFrom<u8> for Packet {
     }
 }
 
+/// Internal state for reading a subpacket byte-by-byte
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Subpacket {
+    Idle,
+    Data,
+    Crc(Packet),
+}
+
 /// Send or receive transmission state
-pub struct State {
-    stage: Stage,
+pub struct Transmission {
+    stage: State,
     count: u32,
     file_name: String,
     file_size: u32,
     buf: Buffer<SUBPACKET_MAX_SIZE>,
+    data_encoding: Encoding,
+    subpacket: Subpacket,
+    crc_calculator_16: crc::Crc16,
+    crc_calculator_32: crc::Crc32,
+    crc_bytes_read: u8,
+    crc_buf: [u8; 4],
 }
 
-impl Default for State {
+impl Default for Transmission {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl State {
+impl Transmission {
     /// Create a new transmission context
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            stage: Stage::SessionBegin,
+            stage: State::SessionBegin,
             count: 0,
             file_name: String::new(),
             file_size: 0,
             buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
+            data_encoding: Encoding::ZBIN,
+            subpacket: Subpacket::Idle,
+            crc_calculator_16: crc::Crc16::new(),
+            crc_calculator_32: crc::Crc32::new(),
+            crc_bytes_read: 0,
+            crc_buf: [0; 4],
         }
     }
 
@@ -514,12 +157,12 @@ impl State {
             .map_err(|_| Error::OutOfMemory)?;
         self.file_size = file_size;
         self.count = 0;
-        self.stage = Stage::FileEnd;
+        self.stage = State::FileEnd;
         Ok(())
     }
 
     #[must_use]
-    pub fn stage(&self) -> Stage {
+    pub fn stage(&self) -> State {
         self.stage
     }
 
@@ -550,23 +193,17 @@ impl State {
         P: Read + Write + ?Sized,
         F: Read + Seek + ?Sized,
     {
-        self.send_impl(port, file)
-    }
-
-    fn send_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-        F: Read + Seek + ?Sized,
-    {
-        if self.stage == Stage::SessionBegin {
+        if self.stage == State::SessionBegin {
             if ZRQINIT_HEADER.write(port)?.is_none() {
                 return Ok(None);
             }
-        } else if self.stage == Stage::FileEnd {
+            self.stage = State::SessionSyncing;
+            return Ok(Some(()));
+        } else if self.stage == State::FileEnd {
             if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none() {
                 return Ok(None);
             }
-            self.stage = Stage::FileBegin;
+            self.stage = State::FileBegin;
             return Ok(Some(()));
         }
 
@@ -587,30 +224,32 @@ impl State {
 
         match header.frame() {
             Frame::ZRINIT => {
-                if self.stage == Stage::SessionBegin {
+                if self.stage == State::SessionSyncing {
                     if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none()
                     {
                         return Ok(None);
                     }
-                    self.stage = Stage::FileBegin;
-                } else if self.stage == Stage::FileInProgress {
-                    self.stage = Stage::FileEnd;
+                    self.stage = State::FileBegin;
+                } else if self.stage == State::FileWaitingSubpacket {
+                    self.stage = State::FileEnd;
                 }
             }
             Frame::ZRPOS | Frame::ZACK => {
-                if self.stage == Stage::SessionBegin {
+                if self.stage == State::SessionSyncing {
                     if ZRQINIT_HEADER.write(port)?.is_none() {
                         return Ok(None);
                     }
-                } else if self.stage == Stage::FileBegin || self.stage == Stage::FileInProgress {
+                } else if self.stage == State::FileBegin
+                    || self.stage == State::FileWaitingSubpacket
+                {
                     if write_zdata(port, file, header.count())?.is_none() {
                         return Ok(None);
                     }
-                    self.stage = Stage::FileInProgress;
+                    self.stage = State::FileWaitingSubpacket;
                 }
             }
             _ => {
-                if self.stage == Stage::SessionBegin && ZRQINIT_HEADER.write(port)?.is_none() {
+                if self.stage == State::SessionSyncing && ZRQINIT_HEADER.write(port)?.is_none() {
                     return Ok(None);
                 }
             }
@@ -630,15 +269,14 @@ impl State {
         P: Read + Write + ?Sized,
         F: Write + ?Sized,
     {
-        self.receive_impl(port, file)
-    }
+        if self.stage == State::FileReadingSubpacket {
+            return self.receive_subpacket(port, file);
+        }
+        if self.stage == State::FileReadingMetadata {
+            return self.receive_subpacket_metadata(port);
+        }
 
-    fn receive_impl<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-        F: Write + ?Sized,
-    {
-        if self.stage == Stage::SessionBegin && write_zrinit(port)?.is_none() {
+        if self.stage == State::SessionBegin && write_zrinit(port)?.is_none() {
             return Ok(None);
         }
 
@@ -646,8 +284,8 @@ impl State {
             Ok(Some(v)) => Ok(Some(v)),
             Ok(None) => return Ok(None),
             Err(Error::Read(err)) => {
-                if self.stage == Stage::FileBegin {
-                    self.stage = Stage::SessionEnd;
+                if self.stage == State::FileBegin {
+                    self.stage = State::SessionEnd;
                     return Ok(Some(()));
                 }
                 Err(Error::Read(err))
@@ -662,8 +300,8 @@ impl State {
             Ok(Some(header)) => header,
             Ok(None) => return Ok(None),
             Err(Error::Read(err)) => {
-                if self.stage == Stage::FileBegin {
-                    self.stage = Stage::SessionEnd;
+                if self.stage == State::FileBegin {
+                    self.stage = State::SessionEnd;
                     return Ok(Some(()));
                 }
                 return Err(Error::Read(err));
@@ -678,45 +316,51 @@ impl State {
 
         match header.frame() {
             Frame::ZFILE => {
-                if self.stage == Stage::SessionBegin || self.stage == Stage::FileBegin {
-                    if read_zfile(port, self, header.encoding())?.is_none() {
-                        return Ok(None);
-                    }
-                    self.stage = Stage::FileBegin;
+                if self.stage == State::SessionBegin || self.stage == State::FileBegin {
+                    self.data_encoding = header.encoding();
+                    self.stage = State::FileReadingMetadata;
+                    self.subpacket = Subpacket::Data;
+                    self.crc_calculator_16 = crc::Crc16::new();
+                    self.crc_calculator_32 = crc::Crc32::new();
+                    self.buf.clear();
                 }
             }
             Frame::ZDATA => {
-                if self.stage == Stage::SessionBegin {
+                if self.stage == State::SessionBegin {
                     if write_zrinit(port)?.is_none() {
                         return Ok(None);
                     }
-                } else if self.stage == Stage::FileBegin || self.stage == Stage::FileInProgress {
+                } else if self.stage == State::FileBegin
+                    || self.stage == State::FileWaitingSubpacket
+                {
                     if header.count() != self.count {
                         if ZRPOS_HEADER.with_count(self.count).write(port)?.is_none() {
                             return Ok(None);
                         }
                         return Ok(Some(()));
                     }
-                    if read_zdata(port, self, header.encoding(), file)?.is_none() {
-                        return Ok(None);
-                    }
-                    self.stage = Stage::FileInProgress;
+                    self.data_encoding = header.encoding();
+                    self.stage = State::FileReadingSubpacket;
+                    self.subpacket = Subpacket::Data;
+                    self.crc_calculator_16 = crc::Crc16::new();
+                    self.crc_calculator_32 = crc::Crc32::new();
+                    self.buf.clear();
                 }
             }
             Frame::ZEOF => {
-                if self.stage == Stage::FileInProgress && header.count() == self.count {
+                if self.stage == State::FileWaitingSubpacket && header.count() == self.count {
                     if write_zrinit(port)?.is_none() {
                         return Ok(None);
                     }
-                    self.stage = Stage::FileBegin;
+                    self.stage = State::FileBegin;
                 }
             }
             Frame::ZFIN => {
-                if self.stage == Stage::FileInProgress || self.stage == Stage::FileBegin {
+                if self.stage == State::FileWaitingSubpacket || self.stage == State::FileBegin {
                     if ZFIN_HEADER.write(port)?.is_none() {
                         return Ok(None);
                     }
-                    self.stage = Stage::SessionEnd;
+                    self.stage = State::SessionEnd;
                 }
             }
             _ => {}
@@ -724,26 +368,246 @@ impl State {
         Ok(Some(()))
     }
 
+    /// Parses the file info buffer after a ZFILE subpacket is received.
+    fn parse_zfile_buf(&mut self) -> Result<(), Error> {
+        let payload = &self.buf;
+        let mut fields = payload.split(|&b| b == b'\0');
+
+        let file_name_bytes = fields.next().ok_or(Error::MalformedFileName)?;
+        if file_name_bytes.is_empty() {
+            return Err(Error::MalformedFileName);
+        }
+
+        core::str::from_utf8(file_name_bytes).map_err(|_| Error::MalformedFileName)?;
+
+        self.file_name.clear();
+        self.file_name
+            .extend_from_slice(file_name_bytes)
+            .map_err(|_| Error::OutOfMemory)?;
+
+        if let Some(size_str_bytes) = fields.next() {
+            let size_field_bytes = size_str_bytes
+                .split(|&b| b == b' ')
+                .next()
+                .unwrap_or_default();
+
+            self.file_size = parse_file_size(size_field_bytes)?;
+        } else {
+            self.file_size = 0;
+        }
+
+        self.count = 0;
+        Ok(())
+    }
+
+    /// Handles the byte-by-byte reading of a ZFILE info subpacket.
+    fn receive_subpacket_metadata<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
+    where
+        P: Read + Write + ?Sized,
+    {
+        match self.subpacket {
+            Subpacket::Data => {
+                let Some(byte) = port.read_byte()? else {
+                    return Ok(None);
+                };
+
+                if byte == ZDLE {
+                    let Some(byte) = port.read_byte()? else {
+                        return Ok(None);
+                    };
+                    if let Ok(packet) = Packet::try_from(byte) {
+                        if self.data_encoding == Encoding::ZBIN32 {
+                            self.crc_calculator_32.update_byte(packet as u8);
+                        } else {
+                            self.crc_calculator_16.update_byte(packet as u8);
+                        }
+                        self.subpacket = Subpacket::Crc(packet);
+                        self.crc_bytes_read = 0;
+                        self.crc_buf = [0; 4];
+                    } else {
+                        let unescaped = zdle::UNZDLE_TABLE[byte as usize];
+                        self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
+                        if self.data_encoding == Encoding::ZBIN32 {
+                            self.crc_calculator_32.update_byte(unescaped);
+                        } else {
+                            self.crc_calculator_16.update_byte(unescaped);
+                        }
+                    }
+                } else {
+                    self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
+                    if self.data_encoding == Encoding::ZBIN32 {
+                        self.crc_calculator_32.update_byte(byte);
+                    } else {
+                        self.crc_calculator_16.update_byte(byte);
+                    }
+                }
+                Ok(Some(()))
+            }
+            Subpacket::Crc(_) => {
+                let crc_len = if self.data_encoding == Encoding::ZBIN32 {
+                    4
+                } else {
+                    2
+                };
+
+                let Some(byte) = read_byte_unescaped(port)? else {
+                    return Ok(None);
+                };
+                self.crc_buf[self.crc_bytes_read as usize] = byte;
+                self.crc_bytes_read += 1;
+
+                if self.crc_bytes_read < crc_len {
+                    return Ok(Some(()));
+                }
+
+                if self.data_encoding == Encoding::ZBIN32 {
+                    let expected_crc = self.crc_calculator_32.finalize().to_le_bytes();
+                    if expected_crc != self.crc_buf {
+                        return Err(Error::UnexpectedCrc32);
+                    }
+                } else {
+                    let expected_crc = self.crc_calculator_16.finalize().to_be_bytes();
+                    if expected_crc != [self.crc_buf[0], self.crc_buf[1]] {
+                        return Err(Error::UnexpectedCrc16);
+                    }
+                }
+
+                self.parse_zfile_buf()?;
+                self.buf.clear();
+                self.crc_calculator_16 = crc::Crc16::new();
+                self.crc_calculator_32 = crc::Crc32::new();
+
+                if ZRPOS_HEADER.with_count(0).write(port)?.is_none() {
+                    return Ok(None);
+                }
+
+                self.stage = State::FileBegin;
+                self.subpacket = Subpacket::Idle;
+                Ok(Some(()))
+            }
+            Subpacket::Idle => Err(Error::Unsupported),
+        }
+    }
+
+    /// Handles the byte-by-byte reading of a ZDATA subpacket.
+    fn receive_subpacket<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
+    where
+        P: Read + Write + ?Sized,
+        F: Write + ?Sized,
+    {
+        match self.subpacket {
+            Subpacket::Data => {
+                let Some(byte) = port.read_byte()? else {
+                    return Ok(None);
+                };
+
+                if byte == ZDLE {
+                    let Some(byte) = port.read_byte()? else {
+                        return Ok(None);
+                    };
+                    if let Ok(packet) = Packet::try_from(byte) {
+                        if self.data_encoding == Encoding::ZBIN32 {
+                            self.crc_calculator_32.update_byte(packet as u8);
+                        } else {
+                            self.crc_calculator_16.update_byte(packet as u8);
+                        }
+                        self.subpacket = Subpacket::Crc(packet);
+                        self.crc_bytes_read = 0;
+                        self.crc_buf = [0; 4];
+                    } else {
+                        let unescaped = zdle::UNZDLE_TABLE[byte as usize];
+                        self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
+                        if self.data_encoding == Encoding::ZBIN32 {
+                            self.crc_calculator_32.update_byte(unescaped);
+                        } else {
+                            self.crc_calculator_16.update_byte(unescaped);
+                        }
+                    }
+                } else {
+                    self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
+                    if self.data_encoding == Encoding::ZBIN32 {
+                        self.crc_calculator_32.update_byte(byte);
+                    } else {
+                        self.crc_calculator_16.update_byte(byte);
+                    }
+                }
+                Ok(Some(()))
+            }
+            Subpacket::Crc(packet) => {
+                let crc_len = if self.data_encoding == Encoding::ZBIN32 {
+                    4
+                } else {
+                    2
+                };
+
+                let Some(byte) = read_byte_unescaped(port)? else {
+                    return Ok(None);
+                };
+                self.crc_buf[self.crc_bytes_read as usize] = byte;
+                self.crc_bytes_read += 1;
+
+                if self.crc_bytes_read < crc_len {
+                    return Ok(Some(()));
+                }
+
+                if self.data_encoding == Encoding::ZBIN32 {
+                    let expected_crc = self.crc_calculator_32.finalize().to_le_bytes();
+                    if expected_crc != self.crc_buf {
+                        return Err(Error::UnexpectedCrc32);
+                    }
+                } else {
+                    let expected_crc = self.crc_calculator_16.finalize().to_be_bytes();
+                    if expected_crc != [self.crc_buf[0], self.crc_buf[1]] {
+                        return Err(Error::UnexpectedCrc16);
+                    }
+                }
+
+                if file.write_all(&self.buf)?.is_none() {
+                    return Ok(None);
+                }
+                self.count += u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
+                self.buf.clear();
+                self.crc_calculator_16 = crc::Crc16::new();
+                self.crc_calculator_32 = crc::Crc32::new();
+
+                match packet {
+                    Packet::ZCRCW | Packet::ZCRCQ => {
+                        if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
+                            return Ok(None);
+                        }
+                        self.subpacket = Subpacket::Data;
+                    }
+                    Packet::ZCRCG => {
+                        self.subpacket = Subpacket::Data;
+                    }
+                    Packet::ZCRCE => {
+                        self.stage = State::FileWaitingSubpacket;
+                        self.subpacket = Subpacket::Idle;
+                    }
+                }
+                Ok(Some(()))
+            }
+            Subpacket::Idle => Err(Error::Unsupported),
+        }
+    }
+
     /// Send ZFIN.
     ///
     /// # Errors
     ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected.
     pub fn finish<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
     {
-        self.finish_impl(port)
-    }
-
-    fn finish_impl<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-    {
-        if ZFIN_HEADER.write(port)?.is_none() {
-            return Ok(None);
+        if self.stage != State::SessionTeardown {
+            if ZFIN_HEADER.write(port)?.is_none() {
+                return Ok(None);
+            }
+            self.stage = State::SessionTeardown;
+            return Ok(Some(()));
         }
 
         let Some(()) = read_zpad(port)? else {
@@ -769,7 +633,7 @@ impl State {
                 if port.write_byte(b'O')?.is_none() {
                     return Ok(None);
                 }
-                self.stage = Stage::SessionEnd;
+                self.stage = State::SessionEnd;
             }
             _ => {
                 if ZFIN_HEADER.write(port)?.is_none() {
@@ -783,12 +647,16 @@ impl State {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Stage {
+pub enum State {
     FileBegin,
     FileEnd,
-    FileInProgress,
+    FileReadingMetadata,
+    FileReadingSubpacket,
+    FileWaitingSubpacket,
     SessionBegin,
     SessionEnd,
+    SessionSyncing,
+    SessionTeardown,
 }
 
 /// Writes ZRINIT
@@ -864,55 +732,6 @@ where
     write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, buf)
 }
 
-/// Parses filename and size from the subpacket sent after the `Frame::ZFiLE`
-/// header.
-fn read_zfile<P>(port: &mut P, state: &mut State, encoding: Encoding) -> Result<Option<()>, Error>
-where
-    P: Read + Write + ?Sized,
-{
-    match read_subpacket(port, &mut state.buf, encoding) {
-        Ok(Some(_)) => {
-            let payload = &state.buf;
-            let mut fields = payload.split(|&b| b == b'\0');
-
-            let file_name_bytes = fields.next().ok_or(Error::MalformedFileName)?;
-            if file_name_bytes.is_empty() {
-                return Err(Error::MalformedFileName);
-            }
-
-            core::str::from_utf8(file_name_bytes).map_err(|_| Error::MalformedFileName)?;
-
-            state.file_name.clear();
-            state
-                .file_name
-                .extend_from_slice(file_name_bytes)
-                .map_err(|_| Error::OutOfMemory)?;
-
-            if let Some(size_str_bytes) = fields.next() {
-                let size_field_bytes = size_str_bytes
-                    .split(|&b| b == b' ')
-                    .next()
-                    .unwrap_or_default();
-
-                state.file_size = parse_file_size(size_field_bytes)?;
-            } else {
-                state.file_size = 0;
-            }
-
-            state.count = 0;
-
-            ZRPOS_HEADER.with_count(0).write(port)
-        }
-        Ok(None) => Ok(None),
-        Err(e) => {
-            if ZNAK_HEADER.write(port)?.is_none() {
-                return Ok(None);
-            }
-            Err(e)
-        }
-    }
-}
-
 /// Writes ZDATA
 fn write_zdata<P, F>(port: &mut P, file: &mut F, offset: u32) -> Result<Option<()>, Error>
 where
@@ -959,53 +778,6 @@ where
     write_subpacket(port, Encoding::ZBIN32, Packet::ZCRCW, &read_buf[..count])
 }
 
-/// Reads ZDATA
-fn read_zdata<P, F>(
-    port: &mut P,
-    state: &mut State,
-    encoding: Encoding,
-    file: &mut F,
-) -> Result<Option<()>, Error>
-where
-    P: Read + Write + ?Sized,
-    F: Write + ?Sized,
-{
-    loop {
-        let zcrc = match read_subpacket(port, &mut state.buf, encoding) {
-            Ok(Some(zcrc)) => zcrc,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                if ZNAK_HEADER.with_count(state.count).write(port)?.is_none() {
-                    return Ok(None);
-                }
-                return Err(e);
-            }
-        };
-
-        if file.write_all(&state.buf)?.is_none() {
-            return Ok(None);
-        }
-        state.count += u32::try_from(state.buf.len()).map_err(|_| Error::OutOfMemory)?;
-        match zcrc {
-            Packet::ZCRCW => {
-                if ZACK_HEADER.with_count(state.count).write(port)?.is_none() {
-                    return Ok(None);
-                }
-                return Ok(Some(()));
-            }
-            Packet::ZCRCE => {
-                return Ok(Some(()));
-            }
-            Packet::ZCRCQ => {
-                if ZACK_HEADER.with_count(state.count).write(port)?.is_none() {
-                    return Ok(None);
-                }
-            }
-            Packet::ZCRCG => (),
-        }
-    }
-}
-
 /// Skips (ZPAD, [ZPAD,] ZDLE) sequence.
 ///
 /// # Errors
@@ -1016,105 +788,31 @@ fn read_zpad<P>(port: &mut P) -> Result<Option<()>, Error>
 where
     P: Read + ?Sized,
 {
-    loop {
-        let Some(b) = port.read_byte()? else {
-            return Ok(None);
-        };
-        if b != ZPAD {
-            continue;
-        }
-
-        let Some(b) = port.read_byte()? else {
-            return Ok(None);
-        };
-        if b == ZDLE {
-            return Ok(Some(()));
-        }
-
-        if b == ZPAD {
-            let Some(b) = port.read_byte()? else {
-                return Ok(None);
-            };
-            if b == ZDLE {
-                return Ok(Some(()));
-            }
-        }
-    }
-}
-
-/// Reads and unescapes a ZMODEM protocol subpacket.
-///
-/// # Errors
-///
-/// Returns `Error::Data` if the subpacket fails CRC validation or is malformed.
-///
-/// # Panics
-///
-/// The function will panic if the buffer is somehow empty when attempting to
-/// pop the CRC byte, which should not happen in a valid transmission.
-fn read_subpacket<P>(
-    port: &mut P,
-    buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
-    encoding: Encoding,
-) -> Result<Option<Packet>, Error>
-where
-    P: Read + ?Sized,
-{
-    buf.clear();
-
-    let (mut crc16, mut crc32) = (crc::Crc16::new(), crc::Crc32::new());
-
-    let result = loop {
-        let Some(byte) = port.read_byte()? else {
-            return Ok(None);
-        };
-        if byte == ZDLE {
-            let Some(byte) = port.read_byte()? else {
-                return Ok(None);
-            };
-            if let Ok(packet) = Packet::try_from(byte) {
-                if encoding == Encoding::ZBIN32 {
-                    crc32.update_byte(packet as u8);
-                } else {
-                    crc16.update_byte(packet as u8);
-                }
-                break packet;
-            }
-            let unescaped = zdle::UNZDLE_TABLE[byte as usize];
-            buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
-            if encoding == Encoding::ZBIN32 {
-                crc32.update_byte(unescaped);
-            } else {
-                crc16.update_byte(unescaped);
-            }
-        } else {
-            buf.push(byte).map_err(|_| Error::OutOfMemory)?;
-            if encoding == Encoding::ZBIN32 {
-                crc32.update_byte(byte);
-            } else {
-                crc16.update_byte(byte);
-            }
-        }
+    let Some(b) = port.read_byte()? else {
+        return Ok(None);
     };
-
-    let crc_len = if encoding == Encoding::ZBIN32 { 4 } else { 2 };
-    let mut crc_bytes = [0u8; 4];
-    for b in crc_bytes.iter_mut().take(crc_len) {
-        let Some(byte) = read_byte_unescaped(port)? else {
-            return Ok(None);
-        };
-        *b = byte;
+    if b != ZPAD {
+        return Ok(None);
     }
 
-    if encoding == Encoding::ZBIN32 {
-        if crc32.finalize().to_le_bytes() != crc_bytes {
-            return Err(Error::UnexpectedCrc32);
-        }
-    } else if crc16.finalize().to_be_bytes() != [crc_bytes[0], crc_bytes[1]] {
-        return Err(Error::UnexpectedCrc16);
+    let Some(b) = port.read_byte()? else {
+        return Ok(None);
+    };
+    if b == ZDLE {
+        return Ok(Some(()));
+    }
+    if b != ZPAD {
+        return Ok(None);
     }
 
-    Ok(Some(result))
+    let Some(b) = port.read_byte()? else {
+        return Ok(None);
+    };
+    if b == ZDLE {
+        return Ok(Some(()));
+    }
+
+    Ok(None)
 }
 
 /// Writes a subpacket.
@@ -1161,31 +859,6 @@ where
     }
 }
 
-fn check_crc(data: &[u8], crc: &[u8], encoding: Encoding) -> Result<(), Error> {
-    let mut crc2 = [0u8; 4];
-    let crc2_len = make_crc(data, &mut crc2, encoding);
-    if *crc == crc2[..crc2_len] {
-        Ok(())
-    } else if encoding == Encoding::ZBIN32 {
-        Err(Error::UnexpectedCrc32)
-    } else {
-        Err(Error::UnexpectedCrc16)
-    }
-}
-
-fn make_crc(data: &[u8], out: &mut [u8], encoding: Encoding) -> usize {
-    if encoding == Encoding::ZBIN32 {
-        let crc = crate::crc::crc32_iso_hdlc(data).to_le_bytes();
-        out[..4].copy_from_slice(&crc[..4]);
-        4
-    } else {
-        let crc = crate::crc::crc16_xmodem(data).to_be_bytes();
-        out[..2].copy_from_slice(&crc[..2]);
-        2
-    }
-}
-
-#[allow(dead_code)]
 fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
