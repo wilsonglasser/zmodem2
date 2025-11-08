@@ -399,49 +399,55 @@ impl Transmission {
         Ok(())
     }
 
+    /// Handles reading a single byte for the `Subpacket::Data` stage.
+    fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
+    where
+        P: Read + Write + ?Sized,
+    {
+        let Some(byte) = port.read_byte()? else {
+            return Ok(None);
+        };
+
+        if byte == ZDLE {
+            let Some(byte) = port.read_byte()? else {
+                return Ok(None);
+            };
+            if let Ok(packet) = Packet::try_from(byte) {
+                if self.data_encoding == Encoding::ZBIN32 {
+                    self.crc_calculator_32.update_byte(packet as u8);
+                } else {
+                    self.crc_calculator_16.update_byte(packet as u8);
+                }
+                self.subpacket = Subpacket::Crc(packet);
+                self.crc_bytes_read = 0;
+                self.crc_buf = [0; 4];
+            } else {
+                let unescaped = zdle::UNZDLE_TABLE[byte as usize];
+                self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
+                if self.data_encoding == Encoding::ZBIN32 {
+                    self.crc_calculator_32.update_byte(unescaped);
+                } else {
+                    self.crc_calculator_16.update_byte(unescaped);
+                }
+            }
+        } else {
+            self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
+            if self.data_encoding == Encoding::ZBIN32 {
+                self.crc_calculator_32.update_byte(byte);
+            } else {
+                self.crc_calculator_16.update_byte(byte);
+            }
+        }
+        Ok(Some(()))
+    }
+
     /// Handles the byte-by-byte reading of a ZFILE info subpacket.
     fn receive_subpacket_metadata<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
     {
         match self.subpacket {
-            Subpacket::Data => {
-                let Some(byte) = port.read_byte()? else {
-                    return Ok(None);
-                };
-
-                if byte == ZDLE {
-                    let Some(byte) = port.read_byte()? else {
-                        return Ok(None);
-                    };
-                    if let Ok(packet) = Packet::try_from(byte) {
-                        if self.data_encoding == Encoding::ZBIN32 {
-                            self.crc_calculator_32.update_byte(packet as u8);
-                        } else {
-                            self.crc_calculator_16.update_byte(packet as u8);
-                        }
-                        self.subpacket = Subpacket::Crc(packet);
-                        self.crc_bytes_read = 0;
-                        self.crc_buf = [0; 4];
-                    } else {
-                        let unescaped = zdle::UNZDLE_TABLE[byte as usize];
-                        self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
-                        if self.data_encoding == Encoding::ZBIN32 {
-                            self.crc_calculator_32.update_byte(unescaped);
-                        } else {
-                            self.crc_calculator_16.update_byte(unescaped);
-                        }
-                    }
-                } else {
-                    self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
-                    if self.data_encoding == Encoding::ZBIN32 {
-                        self.crc_calculator_32.update_byte(byte);
-                    } else {
-                        self.crc_calculator_16.update_byte(byte);
-                    }
-                }
-                Ok(Some(()))
-            }
+            Subpacket::Data => self.receive_subpacket_data_byte(port),
             Subpacket::Crc(_) => {
                 let crc_len = if self.data_encoding == Encoding::ZBIN32 {
                     4
@@ -495,43 +501,7 @@ impl Transmission {
         F: Write + ?Sized,
     {
         match self.subpacket {
-            Subpacket::Data => {
-                let Some(byte) = port.read_byte()? else {
-                    return Ok(None);
-                };
-
-                if byte == ZDLE {
-                    let Some(byte) = port.read_byte()? else {
-                        return Ok(None);
-                    };
-                    if let Ok(packet) = Packet::try_from(byte) {
-                        if self.data_encoding == Encoding::ZBIN32 {
-                            self.crc_calculator_32.update_byte(packet as u8);
-                        } else {
-                            self.crc_calculator_16.update_byte(packet as u8);
-                        }
-                        self.subpacket = Subpacket::Crc(packet);
-                        self.crc_bytes_read = 0;
-                        self.crc_buf = [0; 4];
-                    } else {
-                        let unescaped = zdle::UNZDLE_TABLE[byte as usize];
-                        self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
-                        if self.data_encoding == Encoding::ZBIN32 {
-                            self.crc_calculator_32.update_byte(unescaped);
-                        } else {
-                            self.crc_calculator_16.update_byte(unescaped);
-                        }
-                    }
-                } else {
-                    self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
-                    if self.data_encoding == Encoding::ZBIN32 {
-                        self.crc_calculator_32.update_byte(byte);
-                    } else {
-                        self.crc_calculator_16.update_byte(byte);
-                    }
-                }
-                Ok(Some(()))
-            }
+            Subpacket::Data => self.receive_subpacket_data_byte(port),
             Subpacket::Crc(packet) => {
                 let crc_len = if self.data_encoding == Encoding::ZBIN32 {
                     4
