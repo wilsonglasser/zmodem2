@@ -280,9 +280,8 @@ impl Transmission {
             return Ok(None);
         }
 
-        let Some(()) = (match read_zpad(port) {
-            Ok(Some(v)) => Ok(Some(v)),
-            Ok(None) => return Ok(None),
+        let read_zpad_result = read_zpad(port);
+        let Some(()) = (match read_zpad_result {
             Err(Error::Read(err)) => {
                 if self.stage == State::FileBegin {
                     self.stage = State::SessionEnd;
@@ -290,7 +289,7 @@ impl Transmission {
                 }
                 Err(Error::Read(err))
             }
-            Err(e) => Err(e),
+            r => r,
         })?
         else {
             return Ok(None);
