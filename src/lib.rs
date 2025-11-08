@@ -450,7 +450,7 @@ impl Transmission {
                     2
                 };
 
-                let Some(byte) = read_byte_unescaped(port)? else {
+                let Some(byte) = crate::header::read_byte_unescaped(port)? else {
                     return Ok(None);
                 };
                 self.crc_buf[self.crc_bytes_read as usize] = byte;
@@ -540,7 +540,7 @@ impl Transmission {
                     2
                 };
 
-                let Some(byte) = read_byte_unescaped(port)? else {
+                let Some(byte) = crate::header::read_byte_unescaped(port)? else {
                     return Ok(None);
                 };
                 self.crc_buf[self.crc_bytes_read as usize] = byte;
@@ -831,7 +831,7 @@ where
     P: Write + ?Sized,
 {
     let kind = kind as u8;
-    if write_slice_escaped(port, data)?.is_none() {
+    if crate::header::write_slice_escaped(port, data)?.is_none() {
         return Ok(None);
     }
     if port.write_byte(ZDLE)?.is_none() {
@@ -846,56 +846,15 @@ where
             crc.update(data);
             crc.update_byte(kind);
             let buf = crc.finalize().to_le_bytes();
-            write_slice_escaped(port, &buf)
+            crate::header::write_slice_escaped(port, &buf)
         }
         Encoding::ZBIN => {
             let mut crc = crc::Crc16::new();
             crc.update(data);
             crc.update_byte(kind);
             let buf = crc.finalize().to_be_bytes();
-            write_slice_escaped(port, &buf)
+            crate::header::write_slice_escaped(port, &buf)
         }
         Encoding::ZHEX => Err(Error::Unsupported),
     }
-}
-
-fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<Option<()>, Error>
-where
-    P: Write + ?Sized,
-{
-    for value in buf {
-        if write_byte_escaped(port, *value)?.is_none() {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(()))
-}
-
-fn write_byte_escaped<P>(port: &mut P, value: u8) -> Result<Option<()>, Error>
-where
-    P: Write + ?Sized,
-{
-    let escaped = zdle::ZDLE_TABLE[value as usize];
-    if escaped != value && port.write_byte(ZDLE)?.is_none() {
-        return Ok(None);
-    }
-    port.write_byte(escaped)
-}
-
-fn read_byte_unescaped<P>(port: &mut P) -> Result<Option<u8>, Error>
-where
-    P: Read + ?Sized,
-{
-    let Some(b) = port.read_byte()? else {
-        return Ok(None);
-    };
-    Ok(Some(if b == ZDLE {
-        let Some(b) = port.read_byte()? else {
-            return Ok(None);
-        };
-        zdle::UNZDLE_TABLE[b as usize]
-    } else {
-        b
-    }))
 }

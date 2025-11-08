@@ -306,8 +306,7 @@ fn check_crc(data: &[u8], crc: &[u8], encoding: Encoding) -> Result<(), Error> {
     }
 }
 
-#[allow(dead_code)]
-fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<Option<()>, Error>
+pub(crate) fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
@@ -320,7 +319,7 @@ where
     Ok(Some(()))
 }
 
-fn write_byte_escaped<P>(port: &mut P, value: u8) -> Result<Option<()>, Error>
+pub(crate) fn write_byte_escaped<P>(port: &mut P, value: u8) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
@@ -331,7 +330,7 @@ where
     port.write_byte(escaped)
 }
 
-fn read_byte_unescaped<P>(port: &mut P) -> Result<Option<u8>, Error>
+pub(crate) fn read_byte_unescaped<P>(port: &mut P) -> Result<Option<u8>, Error>
 where
     P: Read + ?Sized,
 {
