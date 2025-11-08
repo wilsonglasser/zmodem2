@@ -103,3 +103,18 @@ impl fmt::Display for Packet {
         write!(f, "{:#0x}", *self as u8)
     }
 }
+
+impl std::fmt::Debug for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match core::str::from_utf8(self) {
+            Ok(s) => f.write_str(s),
+            Err(_) => f.debug_list().entries(self.iter()).finish(),
+        }
+    }
+}
+
+impl std::fmt::Display for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(core::str::from_utf8(self).unwrap_or(""))
+    }
+}
