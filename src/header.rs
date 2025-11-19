@@ -77,24 +77,15 @@ impl Header {
     where
         P: Write + ?Sized,
     {
+        if write_header_start(port, self.encoding)?.is_none() {
+            return Ok(None);
+        }
+
         let mut out: Buffer<HEADER_SIZE> = Buffer::new();
-
-        if port.write_byte(ZPAD)?.is_none() {
-            return Ok(None);
-        }
-        if self.encoding == Encoding::ZHEX && port.write_byte(ZPAD)?.is_none() {
-            return Ok(None);
-        }
-        if port.write_byte(ZDLE)?.is_none() {
-            return Ok(None);
-        }
-        if port.write_byte(self.encoding as u8)?.is_none() {
-            return Ok(None);
-        }
-
         out.push(self.frame as u8).map_err(|_| Error::OutOfMemory)?;
         out.extend_from_slice(&self.flags)
             .map_err(|_| Error::OutOfMemory)?;
+
         let mut crc = [0u8; 4];
         let crc_len = make_crc(&out, &mut crc, self.encoding);
         out.extend_from_slice(&crc[..crc_len])
@@ -108,24 +99,14 @@ impl Header {
             if write_slice_escaped(port, hex)?.is_none() {
                 return Ok(None);
             }
+
+            if write_header_end_hex(port, self.frame)?.is_none() {
+                return Ok(None);
+            }
         } else if write_slice_escaped(port, &out)?.is_none() {
             return Ok(None);
         }
 
-        if self.encoding == Encoding::ZHEX {
-            if port.write_byte(b'\r')?.is_none() {
-                return Ok(None);
-            }
-            if port.write_byte(b'\n')?.is_none() {
-                return Ok(None);
-            }
-            if self.frame != Frame::ZACK
-                && self.frame != Frame::ZFIN
-                && port.write_byte(XON)?.is_none()
-            {
-                return Ok(None);
-            }
-        }
         Ok(Some(()))
     }
 
@@ -288,6 +269,38 @@ bitflags! {
         /// Expects 8th bit to be escaped
         const ESC8 = 0x80;
     }
+}
+
+fn write_header_start<P>(port: &mut P, encoding: Encoding) -> Result<Option<()>, Error>
+where
+    P: Write + ?Sized,
+{
+    if port.write_byte(ZPAD)?.is_none() {
+        return Ok(None);
+    }
+    if encoding == Encoding::ZHEX && port.write_byte(ZPAD)?.is_none() {
+        return Ok(None);
+    }
+    if port.write_byte(ZDLE)?.is_none() {
+        return Ok(None);
+    }
+    port.write_byte(encoding as u8)
+}
+
+fn write_header_end_hex<P>(port: &mut P, frame: Frame) -> Result<Option<()>, Error>
+where
+    P: Write + ?Sized,
+{
+    if port.write_byte(b'\r')?.is_none() {
+        return Ok(None);
+    }
+    if port.write_byte(b'\n')?.is_none() {
+        return Ok(None);
+    }
+    if frame != Frame::ZACK && frame != Frame::ZFIN && port.write_byte(XON)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(()))
 }
 
 fn make_crc(data: &[u8], out: &mut [u8], encoding: Encoding) -> usize {
