@@ -16,8 +16,6 @@ use crate::string::String;
 use crate::zdle;
 use crate::{ZDLE, ZPAD};
 use core::fmt::Write as _;
-use strum::EnumIter;
-use strum::IntoEnumIterator;
 
 /// Size of the unescaped subpacket payload. The size is picked from the
 /// original ZMODEM specification.
@@ -29,7 +27,7 @@ const SUBPACKET_PER_ACK: usize = 10;
 /// The ZMODEM protocol subpacket type
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SubpacketType {
     ZCRCE = 0x68,
     ZCRCG = 0x69,
@@ -41,9 +39,13 @@ impl TryFrom<u8> for SubpacketType {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        SubpacketType::iter()
-            .find(|e| value == *e as u8)
-            .ok_or(Error::MalformedPacket(value))
+        match value {
+            0x68 => Ok(SubpacketType::ZCRCE),
+            0x69 => Ok(SubpacketType::ZCRCG),
+            0x6a => Ok(SubpacketType::ZCRCQ),
+            0x6b => Ok(SubpacketType::ZCRCW),
+            _ => Err(Error::MalformedPacket(value)),
+        }
     }
 }
 

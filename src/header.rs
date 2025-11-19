@@ -11,8 +11,6 @@ use crate::io::{Read, Write};
 use crate::zdle;
 use crate::{XON, ZDLE, ZPAD};
 use bitflags::bitflags;
-use strum::EnumIter;
-use strum::IntoEnumIterator;
 
 /// Buffer size with enough capacity for an escaped header
 const HEADER_SIZE: usize = 32;
@@ -174,7 +172,7 @@ impl Header {
 /// The ZMODEM protocol frame encoding
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Encoding {
     ZBIN = 0x41,
     ZHEX = 0x42,
@@ -185,15 +183,18 @@ impl TryFrom<u8> for Encoding {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Encoding::iter()
-            .find(|e| value == *e as u8)
-            .ok_or(Error::MalformedEncoding(value))
+        match value {
+            0x41 => Ok(Encoding::ZBIN),
+            0x42 => Ok(Encoding::ZHEX),
+            0x43 => Ok(Encoding::ZBIN32),
+            _ => Err(Error::MalformedEncoding(value)),
+        }
     }
 }
 
 #[repr(u8)]
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 /// Frame types
 pub enum Frame {
     /// Request receive init
@@ -242,9 +243,29 @@ impl TryFrom<u8> for Frame {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Frame::iter()
-            .find(|t| value == *t as u8)
-            .ok_or(Error::MalformedFrame(value))
+        match value {
+            0 => Ok(Frame::ZRQINIT),
+            1 => Ok(Frame::ZRINIT),
+            2 => Ok(Frame::ZSINIT),
+            3 => Ok(Frame::ZACK),
+            4 => Ok(Frame::ZFILE),
+            5 => Ok(Frame::ZSKIP),
+            6 => Ok(Frame::ZNAK),
+            7 => Ok(Frame::ZABORT),
+            8 => Ok(Frame::ZFIN),
+            9 => Ok(Frame::ZRPOS),
+            10 => Ok(Frame::ZDATA),
+            11 => Ok(Frame::ZEOF),
+            12 => Ok(Frame::ZFERR),
+            13 => Ok(Frame::ZCRC),
+            14 => Ok(Frame::ZCHALLENGE),
+            15 => Ok(Frame::ZCOMPL),
+            16 => Ok(Frame::ZCAN),
+            17 => Ok(Frame::ZFREECNT),
+            18 => Ok(Frame::ZCOMMAND),
+            19 => Ok(Frame::ZSTDERR),
+            _ => Err(Error::MalformedFrame(value)),
+        }
     }
 }
 
