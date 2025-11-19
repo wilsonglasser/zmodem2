@@ -4,6 +4,7 @@
 //! A simple stack-allocated buffer with a fixed capacity for staging data coming
 //! from the serial link.
 
+use core::fmt;
 use core::ops::{Deref, DerefMut};
 
 /// An error indicating a buffer's capacity was exceeded.
@@ -94,6 +95,12 @@ impl<const CAP: usize> Buffer<CAP> {
         self.bytes[self.len..end].copy_from_slice(slice);
         self.len = end;
         Ok(())
+    }
+}
+
+impl<const CAP: usize> fmt::Write for Buffer<CAP> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.extend_from_slice(s.as_bytes()).map_err(|_| fmt::Error)
     }
 }
 

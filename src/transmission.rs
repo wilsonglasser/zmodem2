@@ -15,6 +15,7 @@ use crate::io::{Read, Seek, Write};
 use crate::string::String;
 use crate::zdle;
 use crate::{ZDLE, ZPAD};
+use core::fmt::Write as _;
 use strum::EnumIter;
 use strum::IntoEnumIterator;
 
@@ -24,9 +25,6 @@ const SUBPACKET_MAX_SIZE: usize = 1024;
 
 /// The number of subpackets to stream
 const SUBPACKET_PER_ACK: usize = 10;
-
-/// Maximum number of bytes to represent a u32 as ASCII.
-const U32_ASCII_MAX: usize = 10;
 
 /// The ZMODEM protocol subpacket type
 #[repr(u8)]
@@ -631,7 +629,7 @@ fn write_zfile<P>(
     port: &mut P,
     buf: &mut Buffer<SUBPACKET_MAX_SIZE>,
     name: &[u8],
-    mut size: u32,
+    size: u32,
 ) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
@@ -641,25 +639,7 @@ where
         .map_err(|_| Error::OutOfMemory)?;
     buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
 
-    let mut size_buf = [0u8; U32_ASCII_MAX];
-    let size_bytes = {
-        if size == 0 {
-            size_buf[U32_ASCII_MAX - 1] = b'0';
-            &size_buf[U32_ASCII_MAX - 1..]
-        } else {
-            let mut index = U32_ASCII_MAX;
-            while size > 0 {
-                index -= 1;
-                size_buf[index] = b'0' + (size % 10) as u8;
-                size /= 10;
-            }
-            &size_buf[index..]
-        }
-    };
-
-    buf.extend_from_slice(size_bytes)
-        .map_err(|_| Error::OutOfMemory)?;
-    buf.push(b'\0').map_err(|_| Error::OutOfMemory)?;
+    write!(buf, "{size}\0").map_err(|_| Error::OutOfMemory)?;
 
     if Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4])
         .write(port)?
