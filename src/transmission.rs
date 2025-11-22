@@ -53,7 +53,8 @@ impl TryFrom<u8> for SubpacketType {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SubpacketState {
     Idle,
-    Data,
+    Reading,
+    Writing(SubpacketType),
     Crc(SubpacketType),
 }
 
@@ -287,7 +288,7 @@ impl Transmission {
                 if self.state == State::SessionBegin || self.state == State::FileBegin {
                     self.data_encoding = header.encoding();
                     self.state = State::FileReadingMetadata;
-                    self.subpacket_state = SubpacketState::Data;
+                    self.subpacket_state = SubpacketState::Reading;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
@@ -309,7 +310,7 @@ impl Transmission {
                     }
                     self.data_encoding = header.encoding();
                     self.state = State::FileReadingSubpacket;
-                    self.subpacket_state = SubpacketState::Data;
+                    self.subpacket_state = SubpacketState::Reading;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
@@ -368,7 +369,7 @@ impl Transmission {
         Ok(())
     }
 
-    /// Handles reading a single byte for the `SubpacketState::Data` state.
+    /// Handles reading a single byte for the `SubpacketState::Reading` state.
     fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Read + Write + ?Sized,
@@ -416,7 +417,7 @@ impl Transmission {
         P: Read + Write + ?Sized,
     {
         match self.subpacket_state {
-            SubpacketState::Data => self.receive_subpacket_data_byte(port),
+            SubpacketState::Reading => self.receive_subpacket_data_byte(port),
             SubpacketState::Crc(_) => {
                 let crc_len = if self.data_encoding == Encoding::ZBIN32 {
                     4
@@ -459,7 +460,7 @@ impl Transmission {
                 self.subpacket_state = SubpacketState::Idle;
                 Ok(Some(()))
             }
-            SubpacketState::Idle => Err(Error::Unsupported),
+            SubpacketState::Idle | SubpacketState::Writing(_) => Err(Error::Unsupported),
         }
     }
 
@@ -470,7 +471,7 @@ impl Transmission {
         F: Write + ?Sized,
     {
         match self.subpacket_state {
-            SubpacketState::Data => self.receive_subpacket_data_byte(port),
+            SubpacketState::Reading => self.receive_subpacket_data_byte(port),
             SubpacketState::Crc(packet) => {
                 let crc_len = if self.data_encoding == Encoding::ZBIN32 {
                     4
@@ -500,6 +501,10 @@ impl Transmission {
                     }
                 }
 
+                self.subpacket_state = SubpacketState::Writing(packet);
+                Ok(Some(()))
+            }
+            SubpacketState::Writing(packet) => {
                 if file.write_all(&self.buf)?.is_none() {
                     return Ok(None);
                 }
@@ -513,10 +518,10 @@ impl Transmission {
                         if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
                             return Ok(None);
                         }
-                        self.subpacket_state = SubpacketState::Data;
+                        self.subpacket_state = SubpacketState::Reading;
                     }
                     SubpacketType::ZCRCG => {
-                        self.subpacket_state = SubpacketState::Data;
+                        self.subpacket_state = SubpacketState::Reading;
                     }
                     SubpacketType::ZCRCE => {
                         self.state = State::FileWaitingSubpacket;

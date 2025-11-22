@@ -205,6 +205,25 @@ fn setup_rz(dest_dir: &TempDir) -> (Child, MockPort<ChildStdout, ChildStdin>) {
     (rz_process, port)
 }
 
+struct MockBlockingFile {
+    file: File,
+    counter: usize,
+}
+
+impl Write for MockBlockingFile {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.counter += 1;
+        if self.counter % 10 == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.file.flush()
+    }
+}
+
 #[test]
 #[cfg(has_lrzsz)]
 fn test_batch_from_sz() {
@@ -218,7 +237,7 @@ fn test_batch_from_sz() {
 
     let (mut sz_process, mut port) = setup_sz(&test_files);
     let mut state = Transmission::new();
-    let mut open_files: HashMap<Vec<u8>, File> = HashMap::new();
+    let mut open_files: HashMap<Vec<u8>, MockBlockingFile> = HashMap::new();
     let mut sink = std::io::sink();
     let mut current_file_name_bytes: Vec<u8> = Vec::new();
 
@@ -235,7 +254,10 @@ fn test_batch_from_sz() {
                 .unwrap();
             let file_path = dest_dir.path().join(filename);
             let file = File::create(file_path).unwrap();
-            open_files.insert(filename_bytes.to_vec(), file);
+            open_files.insert(
+                filename_bytes.to_vec(),
+                MockBlockingFile { file, counter: 0 },
+            );
             current_file_name_bytes = filename_bytes.to_vec();
         }
 
