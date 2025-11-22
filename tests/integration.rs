@@ -14,7 +14,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use zmodem2::{State, Transmission};
 
 const FILE_COUNT: usize = 10;
 const FILE_SIZE: usize = 50 * 1024;
@@ -170,7 +169,7 @@ fn set_nonblocking(fd: RawFd) {
 
 /// Helper to set up a non-blocking `sz` process.
 fn setup_sz(test_files: &TestFiles) -> (Child, MockPort<ChildStdout, ChildStdin>) {
-    let mut sz_process = Command::new("sz")
+    let mut sz_process = Command::new(env!("ZMODEM_SZ_BIN"))
         .args(&test_files.paths)
         .stdout(Stdio::piped())
         .stdin(Stdio::piped())
@@ -189,7 +188,7 @@ fn setup_sz(test_files: &TestFiles) -> (Child, MockPort<ChildStdout, ChildStdin>
 
 /// Helper to set up a non-blocking `rz` process.
 fn setup_rz(dest_dir: &TempDir) -> (Child, MockPort<ChildStdout, ChildStdin>) {
-    let mut rz_process: Child = Command::new("rz")
+    let mut rz_process: Child = Command::new(env!("ZMODEM_RZ_BIN"))
         .stdout(Stdio::piped())
         .stdin(Stdio::piped())
         .current_dir(dest_dir.path())
@@ -207,8 +206,10 @@ fn setup_rz(dest_dir: &TempDir) -> (Child, MockPort<ChildStdout, ChildStdin>) {
 }
 
 #[test]
-#[cfg(host_has_rzsz)]
+#[cfg(has_lrzsz)]
 fn test_batch_from_sz() {
+    use zmodem2::{State, Transmission};
+
     let test_files = TestFiles::new();
     let dest_dir = tempfile::Builder::new()
         .prefix("zmodem_test_dest_")
@@ -272,8 +273,10 @@ fn test_batch_from_sz() {
 }
 
 #[test]
-#[cfg(host_has_rzsz)]
+#[cfg(has_lrzsz)]
 fn test_batch_to_rz() {
+    use zmodem2::{State, Transmission};
+
     let test_files = TestFiles::new();
     let dest_dir = tempfile::Builder::new()
         .prefix("zmodem_test_dest_")
