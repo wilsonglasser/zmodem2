@@ -603,7 +603,15 @@ where
     P: Write + ?Sized,
 {
     let zrinit = Zrinit::CANFDX | Zrinit::CANOVIO | Zrinit::CANFC32;
-    Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0, 0, 0, zrinit.bits()]).write(port)
+    let buffer_size = u16::try_from(SUBPACKET_MAX_SIZE)
+        .map_err(|_| Error::Unsupported)?
+        .to_le_bytes();
+    Header::new(
+        Encoding::ZHEX,
+        Frame::ZRINIT,
+        &[buffer_size[0], buffer_size[1], 0, zrinit.bits()],
+    )
+    .write(port)
 }
 
 /// Parses a u32 from a slice of ASCII decimal bytes.
