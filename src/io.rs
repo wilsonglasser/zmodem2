@@ -7,6 +7,24 @@ use crate::Error;
 
 /// Write operations.
 pub trait Write {
+    /// Writes bytes from a buffer to the I/O port.
+    ///
+    /// # Errors
+    ///
+    /// [`Data`](crate::Error::Data) when corrupted data has been detected.
+    /// [`Read`](crate::Error::Read) when the read I/O fails with the serial
+    /// port.
+    /// [`Write`](crate::Error::Write) when the write I/O fails with the
+    /// serial port.
+    fn write(&mut self, buf: &[u8]) -> Result<Option<u32>, Error> {
+        if self.write_all(buf)?.is_none() {
+            return Ok(None);
+        }
+        u32::try_from(buf.len())
+            .map(Some)
+            .map_err(|_| Error::OutOfMemory)
+    }
+
     /// Writes the entire buffer to the I/O port.
     ///
     /// # Errors

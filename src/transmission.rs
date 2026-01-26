@@ -65,6 +65,7 @@ pub struct Transmission {
     file_name: String,
     file_size: u32,
     buf: Buffer<SUBPACKET_MAX_SIZE>,
+    buf_write_offset: usize,
     data_encoding: Encoding,
     subpacket_state: SubpacketState,
     crc_calculator_16: crc::Crc16,
@@ -89,6 +90,7 @@ impl Transmission {
             file_name: String::new(),
             file_size: 0,
             buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
+            buf_write_offset: 0,
             data_encoding: Encoding::ZBIN,
             subpacket_state: SubpacketState::Idle,
             crc_calculator_16: crc::Crc16::new(),
@@ -128,6 +130,7 @@ impl Transmission {
         self.file_size = file_size;
         self.count = 0;
         self.state = State::FileEnd;
+        self.buf_write_offset = 0;
         Ok(())
     }
 
@@ -292,6 +295,7 @@ impl Transmission {
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
+                    self.buf_write_offset = 0;
                 }
             }
             Frame::ZDATA => {
@@ -314,6 +318,7 @@ impl Transmission {
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
+                    self.buf_write_offset = 0;
                 }
             }
             Frame::ZEOF => {
@@ -449,6 +454,7 @@ impl Transmission {
 
                 self.parse_zfile_buf()?;
                 self.buf.clear();
+                self.buf_write_offset = 0;
                 self.crc_calculator_16 = crc::Crc16::new();
                 self.crc_calculator_32 = crc::Crc32::new();
 
@@ -502,14 +508,25 @@ impl Transmission {
                 }
 
                 self.subpacket_state = SubpacketState::Writing(packet);
+                self.buf_write_offset = 0;
                 Ok(Some(()))
             }
             SubpacketState::Writing(packet) => {
-                if file.write_all(&self.buf)?.is_none() {
-                    return Ok(None);
+                while self.buf_write_offset < self.buf.len() {
+                    let remaining = &self.buf[self.buf_write_offset..];
+                    let Some(bytes_written) = file.write(remaining)? else {
+                        return Ok(None);
+                    };
+                    let bytes_written =
+                        usize::try_from(bytes_written).map_err(|_| Error::OutOfMemory)?;
+                    self.buf_write_offset = self
+                        .buf_write_offset
+                        .checked_add(bytes_written)
+                        .ok_or(Error::OutOfMemory)?;
                 }
                 self.count += u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
                 self.buf.clear();
+                self.buf_write_offset = 0;
                 self.crc_calculator_16 = crc::Crc16::new();
                 self.crc_calculator_32 = crc::Crc32::new();
 

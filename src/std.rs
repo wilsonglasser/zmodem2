@@ -9,6 +9,21 @@ impl<W> Write for W
 where
     W: std::io::Write,
 {
+    fn write(&mut self, buf: &[u8]) -> Result<Option<u32>, Error> {
+        match std::io::Write::write(self, buf) {
+            Ok(bytes_written) => u32::try_from(bytes_written)
+                .map(Some)
+                .map_err(|_| Error::OutOfMemory),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(Error::Write(String::from(e.to_string().as_str())))
+                }
+            }
+        }
+    }
+
     fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error> {
         match std::io::Write::write_all(self, buf) {
             Ok(()) => Ok(Some(())),
