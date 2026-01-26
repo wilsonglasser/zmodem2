@@ -517,6 +517,9 @@ impl Transmission {
                     let Some(bytes_written) = file.write(remaining)? else {
                         return Ok(None);
                     };
+                    if bytes_written == 0 {
+                        return Err(Error::UnexpectedEof);
+                    }
                     let bytes_written =
                         usize::try_from(bytes_written).map_err(|_| Error::OutOfMemory)?;
                     self.buf_write_offset = self
