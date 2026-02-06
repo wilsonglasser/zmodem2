@@ -8,8 +8,8 @@ use crate::buffer::Buffer;
 use crate::crc;
 use crate::error::Error;
 use crate::header::{
-    read_byte_unescaped, write_slice_escaped, Encoding, Frame, Header, Zrinit, ZACK_HEADER,
-    ZDATA_HEADER, ZEOF_HEADER, ZFIN_HEADER, ZNAK_HEADER, ZRPOS_HEADER, ZRQINIT_HEADER,
+    write_slice_escaped, Encoding, Frame, Header, Zrinit, HEADER_PAYLOAD_SIZE, HEADER_SIZE,
+    ZACK_HEADER, ZDATA_HEADER, ZEOF_HEADER, ZFIN_HEADER, ZNAK_HEADER, ZRPOS_HEADER, ZRQINIT_HEADER,
 };
 use crate::io::{Read, Seek, Write};
 use crate::string::String;
@@ -58,6 +58,20 @@ enum SubpacketState {
     Crc(SubpacketType),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ZpadState {
+    Idle,
+    Zpad,
+    ZpadZpad,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HeaderReadState {
+    SeekingZpad,
+    ReadingEncoding,
+    ReadingData,
+}
+
 /// Send or receive transmission state
 pub struct Transmission {
     state: State,
@@ -67,11 +81,19 @@ pub struct Transmission {
     buf: Buffer<SUBPACKET_MAX_SIZE>,
     buf_write_offset: usize,
     data_encoding: Encoding,
+    header_state: HeaderReadState,
+    zpad_state: ZpadState,
+    header_buf: Buffer<HEADER_SIZE>,
+    header_encoding: Option<Encoding>,
+    header_expected_len: usize,
+    header_escape_pending: bool,
     subpacket_state: SubpacketState,
+    subpacket_escape_pending: bool,
     crc_calculator_16: crc::Crc16,
     crc_calculator_32: crc::Crc32,
     crc_bytes_read: u8,
     crc_buf: [u8; 4],
+    crc_escape_pending: bool,
 }
 
 impl Default for Transmission {
@@ -92,11 +114,19 @@ impl Transmission {
             buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
             buf_write_offset: 0,
             data_encoding: Encoding::ZBIN,
+            header_state: HeaderReadState::SeekingZpad,
+            zpad_state: ZpadState::Idle,
+            header_buf: Buffer::<HEADER_SIZE>::new(),
+            header_encoding: None,
+            header_expected_len: 0,
+            header_escape_pending: false,
             subpacket_state: SubpacketState::Idle,
+            subpacket_escape_pending: false,
             crc_calculator_16: crc::Crc16::new(),
             crc_calculator_32: crc::Crc32::new(),
             crc_bytes_read: 0,
             crc_buf: [0; 4],
+            crc_escape_pending: false,
         }
     }
 
@@ -174,6 +204,97 @@ impl Transmission {
         self.file_size
     }
 
+    fn reset_header_reader(&mut self) {
+        self.header_state = HeaderReadState::SeekingZpad;
+        self.zpad_state = ZpadState::Idle;
+        self.header_encoding = None;
+        self.header_expected_len = 0;
+        self.header_escape_pending = false;
+        self.header_buf.clear();
+    }
+
+    fn advance_zpad_state(&mut self, byte: u8) -> bool {
+        match self.zpad_state {
+            ZpadState::Idle => {
+                if byte == ZPAD {
+                    self.zpad_state = ZpadState::Zpad;
+                }
+            }
+            ZpadState::Zpad | ZpadState::ZpadZpad => {
+                if byte == ZDLE {
+                    self.zpad_state = ZpadState::Idle;
+                    return true;
+                }
+                if byte == ZPAD {
+                    self.zpad_state = ZpadState::ZpadZpad;
+                } else {
+                    self.zpad_state = ZpadState::Idle;
+                }
+            }
+        }
+        false
+    }
+
+    fn read_header<P>(&mut self, port: &mut P) -> Result<Option<Header>, Error>
+    where
+        P: Read + ?Sized,
+    {
+        loop {
+            match self.header_state {
+                HeaderReadState::SeekingZpad => {
+                    let Some(byte) = port.read_byte()? else {
+                        return Ok(None);
+                    };
+                    if self.advance_zpad_state(byte) {
+                        self.header_state = HeaderReadState::ReadingEncoding;
+                    }
+                }
+                HeaderReadState::ReadingEncoding => {
+                    let Some(byte) = port.read_byte()? else {
+                        return Ok(None);
+                    };
+                    let encoding = match Encoding::try_from(byte) {
+                        Ok(encoding) => encoding,
+                        Err(e) => {
+                            self.reset_header_reader();
+                            return Err(e);
+                        }
+                    };
+                    self.header_expected_len = Header::read_size(encoding);
+                    self.header_encoding = Some(encoding);
+                    self.header_escape_pending = false;
+                    self.header_buf.clear();
+                    self.header_state = HeaderReadState::ReadingData;
+                }
+                HeaderReadState::ReadingData => {
+                    while self.header_buf.len() < self.header_expected_len {
+                        let Some(byte) =
+                            read_byte_unescaped_stateful(port, &mut self.header_escape_pending)?
+                        else {
+                            return Ok(None);
+                        };
+                        self.header_buf.push(byte).map_err(|_| Error::OutOfMemory)?;
+                    }
+
+                    let Some(encoding) = self.header_encoding else {
+                        self.reset_header_reader();
+                        return Err(Error::MalformedHeader);
+                    };
+
+                    let header = match decode_header(encoding, &self.header_buf) {
+                        Ok(header) => header,
+                        Err(e) => {
+                            self.reset_header_reader();
+                            return Err(e);
+                        }
+                    };
+                    self.reset_header_reader();
+                    return Ok(Some(header));
+                }
+            }
+        }
+    }
+
     /// Sends a file using the ZMODEM file transfer protocol.
     ///
     /// # Errors
@@ -200,11 +321,7 @@ impl Transmission {
             return Ok(Some(()));
         }
 
-        let Some(()) = read_zpad(port)? else {
-            return Ok(None);
-        };
-
-        let header = match Header::read(port) {
+        let header = match self.read_header(port) {
             Ok(Some(header)) => header,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -273,22 +390,7 @@ impl Transmission {
             return Ok(None);
         }
 
-        let read_zpad_result = read_zpad(port);
-        let Some(()) = (match read_zpad_result {
-            Err(Error::Read(err)) => {
-                if self.state == State::FileBegin {
-                    self.state = State::SessionEnd;
-                    return Ok(Some(()));
-                }
-                Err(Error::Read(err))
-            }
-            r => r,
-        })?
-        else {
-            return Ok(None);
-        };
-
-        let header = match Header::read(port) {
+        let header = match self.read_header(port) {
             Ok(Some(header)) => header,
             Ok(None) => return Ok(None),
             Err(Error::Read(err)) => {
@@ -312,6 +414,8 @@ impl Transmission {
                     self.data_encoding = header.encoding();
                     self.state = State::FileReadingMetadata;
                     self.subpacket_state = SubpacketState::Reading;
+                    self.subpacket_escape_pending = false;
+                    self.crc_escape_pending = false;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
@@ -335,6 +439,8 @@ impl Transmission {
                     self.data_encoding = header.encoding();
                     self.state = State::FileReadingSubpacket;
                     self.subpacket_state = SubpacketState::Reading;
+                    self.subpacket_escape_pending = false;
+                    self.crc_escape_pending = false;
                     self.crc_calculator_16 = crc::Crc16::new();
                     self.crc_calculator_32 = crc::Crc32::new();
                     self.buf.clear();
@@ -397,39 +503,53 @@ impl Transmission {
     where
         P: Read + Write + ?Sized,
     {
-        let Some(byte) = port.read_byte()? else {
-            return Ok(None);
+        let handle_followup = |this: &mut Self, byte: u8| -> Result<Option<()>, Error> {
+            if let Ok(packet) = SubpacketType::try_from(byte) {
+                if this.data_encoding == Encoding::ZBIN32 {
+                    this.crc_calculator_32.update_byte(packet as u8);
+                } else {
+                    this.crc_calculator_16.update_byte(packet as u8);
+                }
+                this.subpacket_state = SubpacketState::Crc(packet);
+                this.crc_bytes_read = 0;
+                this.crc_buf = [0; 4];
+                this.crc_escape_pending = false;
+            } else {
+                let unescaped = zdle::UNZDLE_TABLE[byte as usize];
+                this.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
+                if this.data_encoding == Encoding::ZBIN32 {
+                    this.crc_calculator_32.update_byte(unescaped);
+                } else {
+                    this.crc_calculator_16.update_byte(unescaped);
+                }
+            }
+            Ok(Some(()))
         };
 
-        if byte == ZDLE {
+        if self.subpacket_escape_pending {
             let Some(byte) = port.read_byte()? else {
                 return Ok(None);
             };
-            if let Ok(packet) = SubpacketType::try_from(byte) {
-                if self.data_encoding == Encoding::ZBIN32 {
-                    self.crc_calculator_32.update_byte(packet as u8);
-                } else {
-                    self.crc_calculator_16.update_byte(packet as u8);
-                }
-                self.subpacket_state = SubpacketState::Crc(packet);
-                self.crc_bytes_read = 0;
-                self.crc_buf = [0; 4];
-            } else {
-                let unescaped = zdle::UNZDLE_TABLE[byte as usize];
-                self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
-                if self.data_encoding == Encoding::ZBIN32 {
-                    self.crc_calculator_32.update_byte(unescaped);
-                } else {
-                    self.crc_calculator_16.update_byte(unescaped);
-                }
-            }
+            self.subpacket_escape_pending = false;
+            return handle_followup(self, byte);
+        }
+
+        let Some(byte) = port.read_byte()? else {
+            return Ok(None);
+        };
+        if byte == ZDLE {
+            let Some(next) = port.read_byte()? else {
+                self.subpacket_escape_pending = true;
+                return Ok(None);
+            };
+            return handle_followup(self, next);
+        }
+
+        self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
+        if self.data_encoding == Encoding::ZBIN32 {
+            self.crc_calculator_32.update_byte(byte);
         } else {
-            self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
-            if self.data_encoding == Encoding::ZBIN32 {
-                self.crc_calculator_32.update_byte(byte);
-            } else {
-                self.crc_calculator_16.update_byte(byte);
-            }
+            self.crc_calculator_16.update_byte(byte);
         }
         Ok(Some(()))
     }
@@ -448,7 +568,8 @@ impl Transmission {
                     2
                 };
 
-                let Some(byte) = read_byte_unescaped(port)? else {
+                let Some(byte) = read_byte_unescaped_stateful(port, &mut self.crc_escape_pending)?
+                else {
                     return Ok(None);
                 };
                 self.crc_buf[self.crc_bytes_read as usize] = byte;
@@ -475,6 +596,8 @@ impl Transmission {
                 self.buf_write_offset = 0;
                 self.crc_calculator_16 = crc::Crc16::new();
                 self.crc_calculator_32 = crc::Crc32::new();
+                self.subpacket_escape_pending = false;
+                self.crc_escape_pending = false;
 
                 if ZRPOS_HEADER.with_count(0).write(port)?.is_none() {
                     return Ok(None);
@@ -503,7 +626,8 @@ impl Transmission {
                     2
                 };
 
-                let Some(byte) = read_byte_unescaped(port)? else {
+                let Some(byte) = read_byte_unescaped_stateful(port, &mut self.crc_escape_pending)?
+                else {
                     return Ok(None);
                 };
                 self.crc_buf[self.crc_bytes_read as usize] = byte;
@@ -558,19 +682,27 @@ impl Transmission {
                         }
                         self.state = State::FileWaitingSubpacket;
                         self.subpacket_state = SubpacketState::Idle;
+                        self.subpacket_escape_pending = false;
+                        self.crc_escape_pending = false;
                     }
                     SubpacketType::ZCRCQ => {
                         if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
                             return Ok(None);
                         }
                         self.subpacket_state = SubpacketState::Reading;
+                        self.subpacket_escape_pending = false;
+                        self.crc_escape_pending = false;
                     }
                     SubpacketType::ZCRCG => {
                         self.subpacket_state = SubpacketState::Reading;
+                        self.subpacket_escape_pending = false;
+                        self.crc_escape_pending = false;
                     }
                     SubpacketType::ZCRCE => {
                         self.state = State::FileWaitingSubpacket;
                         self.subpacket_state = SubpacketState::Idle;
+                        self.subpacket_escape_pending = false;
+                        self.crc_escape_pending = false;
                     }
                 }
                 Ok(Some(()))
@@ -598,11 +730,7 @@ impl Transmission {
             return Ok(Some(()));
         }
 
-        let Some(()) = read_zpad(port)? else {
-            return Ok(None);
-        };
-
-        let frame = match Header::read(port) {
+        let frame = match self.read_header(port) {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -645,6 +773,72 @@ pub enum State {
     SessionEnd,
     SessionSyncing,
     SessionTeardown,
+}
+
+fn read_byte_unescaped_stateful<P>(port: &mut P, pending: &mut bool) -> Result<Option<u8>, Error>
+where
+    P: Read + ?Sized,
+{
+    if *pending {
+        let Some(b) = port.read_byte()? else {
+            return Ok(None);
+        };
+        *pending = false;
+        return Ok(Some(zdle::UNZDLE_TABLE[b as usize]));
+    }
+
+    let Some(b) = port.read_byte()? else {
+        return Ok(None);
+    };
+    if b == ZDLE {
+        let Some(next) = port.read_byte()? else {
+            *pending = true;
+            return Ok(None);
+        };
+        return Ok(Some(zdle::UNZDLE_TABLE[next as usize]));
+    }
+
+    Ok(Some(b))
+}
+
+fn decode_header(encoding: Encoding, data: &[u8]) -> Result<Header, Error> {
+    let mut out: Buffer<HEADER_SIZE> = Buffer::new();
+    if encoding == Encoding::ZHEX {
+        if data.len() % 2 != 0 {
+            return Err(Error::MalformedHeader);
+        }
+        let mut out_bytes = [0u8; HEADER_SIZE / 2];
+        let out_len = data.len() / 2;
+        let out_buf = out_bytes.get_mut(..out_len).ok_or(Error::UnexpectedEof)?;
+        hex::decode_to_slice(data, out_buf).map_err(|_| Error::MalformedHeader)?;
+        out.extend_from_slice(out_buf)
+            .map_err(|_| Error::OutOfMemory)?;
+    } else {
+        out.extend_from_slice(data)
+            .map_err(|_| Error::OutOfMemory)?;
+    }
+
+    let crc_len = if encoding == Encoding::ZBIN32 { 4 } else { 2 };
+    if out.len() < HEADER_PAYLOAD_SIZE + crc_len {
+        return Err(Error::MalformedHeader);
+    }
+    let (payload, crc_bytes) = out.split_at(HEADER_PAYLOAD_SIZE);
+    if encoding == Encoding::ZBIN32 {
+        let expected_crc = crc::crc32_iso_hdlc(payload).to_le_bytes();
+        if crc_bytes != &expected_crc[..crc_len] {
+            return Err(Error::UnexpectedCrc32);
+        }
+    } else {
+        let expected_crc = crc::crc16_xmodem(payload).to_be_bytes();
+        if crc_bytes != &expected_crc[..crc_len] {
+            return Err(Error::UnexpectedCrc16);
+        }
+    }
+
+    let frame = Frame::try_from(payload[0])?;
+    let mut flags = [0u8; 4];
+    flags.copy_from_slice(&payload[1..=4]);
+    Ok(Header::new(encoding, frame, &flags))
 }
 
 /// Writes ZRINIT
@@ -766,43 +960,6 @@ where
         SubpacketType::ZCRCW,
         &read_buf[..count],
     )
-}
-
-/// Skips (ZPAD, [ZPAD,] ZDLE) sequence.
-///
-/// # Errors
-///
-/// Returns `Error::Data` if the sequence is malformed or `Error::Read` on an
-/// I/O error.
-fn read_zpad<P>(port: &mut P) -> Result<Option<()>, Error>
-where
-    P: Read + ?Sized,
-{
-    let Some(b) = port.read_byte()? else {
-        return Ok(None);
-    };
-    if b != ZPAD {
-        return Ok(None);
-    }
-
-    let Some(b) = port.read_byte()? else {
-        return Ok(None);
-    };
-    if b == ZDLE {
-        return Ok(Some(()));
-    }
-    if b != ZPAD {
-        return Ok(None);
-    }
-
-    let Some(b) = port.read_byte()? else {
-        return Ok(None);
-    };
-    if b == ZDLE {
-        return Ok(Some(()));
-    }
-
-    Ok(None)
 }
 
 /// Writes a subpacket.

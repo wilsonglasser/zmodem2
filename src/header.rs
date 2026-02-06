@@ -13,9 +13,9 @@ use crate::{XON, ZDLE, ZPAD};
 use bitflags::bitflags;
 
 /// Buffer size with enough capacity for an escaped header
-const HEADER_SIZE: usize = 32;
+pub(crate) const HEADER_SIZE: usize = 32;
 /// The size of the header payload (frame type + flags).
-const HEADER_PAYLOAD_SIZE: usize = 5;
+pub(crate) const HEADER_PAYLOAD_SIZE: usize = 5;
 
 pub(crate) const ZACK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZACK, &[0; 4]);
 pub(crate) const ZDATA_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZDATA, &[0; 4]);
@@ -160,7 +160,7 @@ impl Header {
     }
 
     /// Returns the serialized size of the header payload (payload + CRC)
-    const fn read_size(encoding: Encoding) -> usize {
+    pub(crate) const fn read_size(encoding: Encoding) -> usize {
         match encoding {
             Encoding::ZBIN => HEADER_PAYLOAD_SIZE + 2,
             Encoding::ZBIN32 => HEADER_PAYLOAD_SIZE + 4,

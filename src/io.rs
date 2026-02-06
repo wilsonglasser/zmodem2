@@ -27,6 +27,8 @@ pub trait Write {
 
     /// Writes the entire buffer to the I/O port.
     ///
+    /// Returns `Ok(None)` only if no bytes were written.
+    ///
     /// # Errors
     ///
     /// [`Data`](crate::Error::Data) when corrupted data has been detected.
@@ -37,6 +39,8 @@ pub trait Write {
     fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error>;
 
     /// Writes a single byte to the I/O port.
+    ///
+    /// Returns `Ok(None)` only if no bytes were written.
     ///
     /// # Errors
     ///
@@ -54,6 +58,8 @@ pub trait Write {
 pub trait Read {
     /// Read bytes from the I/O port.
     ///
+    /// Returns `Ok(None)` only if no bytes were written.
+    ///
     /// # Errors
     ///
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected.
@@ -62,6 +68,8 @@ pub trait Read {
     fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error>;
 
     /// Read a byte from the I/O port.
+    ///
+    /// Returns `Ok(None)` only if no bytes were written.
     ///
     /// # Errors
     ///

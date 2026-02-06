@@ -9,6 +9,8 @@ use zmodem2::{Encoding, Error, Frame, Header, Read, State, Transmission, Write, 
 struct MockPort<'a> {
     input: &'a [u8],
     output: Vec<u8>,
+    would_block: bool,
+    block_next: bool,
 }
 
 impl<'a> MockPort<'a> {
@@ -16,24 +18,45 @@ impl<'a> MockPort<'a> {
         Self {
             input,
             output: Vec::new(),
+            would_block: false,
+            block_next: false,
         }
+    }
+
+    fn with_would_block(mut self) -> Self {
+        self.would_block = true;
+        self
     }
 }
 
 impl<'a> Read for MockPort<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error> {
+        if self.would_block && self.block_next {
+            self.block_next = false;
+            return Ok(None);
+        }
         if self.input.is_empty() {
             return Ok(None);
         }
         let n = cmp::min(self.input.len(), buf.len());
         buf[..n].copy_from_slice(&self.input[..n]);
         self.input = &self.input[n..];
+        if self.would_block {
+            self.block_next = true;
+        }
         Ok(Some(n as u32))
     }
 
     fn read_byte(&mut self) -> Result<Option<u8>, Error> {
+        if self.would_block && self.block_next {
+            self.block_next = false;
+            return Ok(None);
+        }
         if let Some((&first, rest)) = self.input.split_first() {
             self.input = rest;
+            if self.would_block {
+                self.block_next = true;
+            }
             Ok(Some(first))
         } else {
             Ok(None)
@@ -107,11 +130,11 @@ fn test_receive_zfile_with_non_utf8_name() {
     assert!(sender.send(&mut send_port, &mut file) == Ok(Some(())));
 
     let wire = send_port.output;
-    let mut recv_port = MockPort::new(&wire);
+    let mut recv_port = MockPort::new(&wire).with_would_block();
     let mut sink = Vec::new();
     let mut receiver = Transmission::new();
 
-    for _ in 0..(wire.len() + 8) {
+    for _ in 0..(wire.len() * 4) {
         match receiver.receive(&mut recv_port, &mut sink) {
             Ok(Some(())) | Ok(None) => {}
             Err(e) => panic!("receive failed: {e}"),
