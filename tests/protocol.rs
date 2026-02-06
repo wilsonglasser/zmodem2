@@ -4,7 +4,7 @@
 
 use core::cmp;
 use rstest::rstest;
-use zmodem2::{Encoding, Error, Frame, Header, Read, Transmission, Write, XON, ZDLE, ZPAD};
+use zmodem2::{Encoding, Error, Frame, Header, Read, State, Transmission, Write, XON, ZDLE, ZPAD};
 
 struct MockPort<'a> {
     input: &'a [u8],
@@ -94,4 +94,34 @@ fn test_receive_malformed_header() {
 
     let result = state.receive(&mut mock_port, &mut file);
     assert!(matches!(result, Ok(None)));
+}
+
+#[test]
+fn test_receive_zfile_with_non_utf8_name() {
+    let file_name = b"bad\x80name";
+    let file_size = 123;
+    let mut sender = Transmission::new();
+    sender.set_next_file_u8(file_name, file_size).unwrap();
+    let mut send_port = MockPort::new(&[]);
+    let mut file = std::io::Cursor::new(&[]);
+    assert!(sender.send(&mut send_port, &mut file) == Ok(Some(())));
+
+    let wire = send_port.output;
+    let mut recv_port = MockPort::new(&wire);
+    let mut sink = Vec::new();
+    let mut receiver = Transmission::new();
+
+    for _ in 0..(wire.len() + 8) {
+        match receiver.receive(&mut recv_port, &mut sink) {
+            Ok(Some(())) | Ok(None) => {}
+            Err(e) => panic!("receive failed: {e}"),
+        }
+        if receiver.state() == State::FileBegin {
+            break;
+        }
+    }
+
+    assert_eq!(receiver.state(), State::FileBegin);
+    assert_eq!(receiver.file_name(), file_name);
+    assert_eq!(receiver.file_size(), file_size);
 }

@@ -108,10 +108,21 @@ impl Transmission {
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`Data`](crate::Error::Data) when corrupted data has been detected
     pub fn set_first_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
+        Self::set_first_file_u8(file_name.as_bytes(), file_size)
+    }
+
+    /// Create a new transmission context for the first file in a batch.
+    ///
+    /// # Errors
+    ///
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
+    pub fn set_first_file_u8(file_name: &[u8], file_size: u32) -> Result<Self, Error> {
         let mut state = Self::new();
         state
             .file_name
-            .extend_from_slice(file_name.as_bytes())
+            .extend_from_slice(file_name)
             .map_err(|_| Error::OutOfMemory)?;
         state.file_size = file_size;
         Ok(state)
@@ -123,9 +134,18 @@ impl Transmission {
     ///
     /// * [`Data`](crate::Error::Data) when the `file_name` is invalid.
     pub fn set_next_file(&mut self, file_name: &str, file_size: u32) -> Result<(), Error> {
+        self.set_next_file_u8(file_name.as_bytes(), file_size)
+    }
+
+    /// Prepares the state for the next file in a batch transfer.
+    ///
+    /// # Errors
+    ///
+    /// * [`Data`](crate::Error::Data) when the `file_name` is invalid.
+    pub fn set_next_file_u8(&mut self, file_name: &[u8], file_size: u32) -> Result<(), Error> {
         self.file_name.clear();
         self.file_name
-            .extend_from_slice(file_name.as_bytes())
+            .extend_from_slice(file_name)
             .map_err(|_| Error::OutOfMemory)?;
         self.file_size = file_size;
         self.count = 0;
@@ -351,8 +371,6 @@ impl Transmission {
         if file_name_bytes.is_empty() {
             return Err(Error::MalformedFileName);
         }
-
-        core::str::from_utf8(file_name_bytes).map_err(|_| Error::MalformedFileName)?;
 
         self.file_name.clear();
         self.file_name
