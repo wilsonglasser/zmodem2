@@ -534,7 +534,14 @@ impl Transmission {
                 self.crc_calculator_32 = crc::Crc32::new();
 
                 match packet {
-                    SubpacketType::ZCRCW | SubpacketType::ZCRCQ => {
+                    SubpacketType::ZCRCW => {
+                        if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
+                            return Ok(None);
+                        }
+                        self.state = State::FileWaitingSubpacket;
+                        self.subpacket_state = SubpacketState::Idle;
+                    }
+                    SubpacketType::ZCRCQ => {
                         if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
                             return Ok(None);
                         }
