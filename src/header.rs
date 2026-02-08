@@ -28,7 +28,7 @@ pub(crate) const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQ
 /// Data structure for holding a ZMODEM protocol header, which begins a frame,
 /// and is followed optionally by a variable number of subpackets.
 #[repr(C)]
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Header {
     encoding: Encoding,
     frame: Frame,
@@ -70,7 +70,6 @@ impl Header {
     ///
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
     pub fn write<P>(&self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Write + ?Sized,
@@ -115,7 +114,8 @@ impl Header {
     ///
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
+    /// * [`UnexpectedCrc16`](crate::Error::UnexpectedCrc16) or
+    ///   [`UnexpectedCrc32`](crate::Error::UnexpectedCrc32) when corrupted data has been detected
     pub fn read<P>(port: &mut P) -> Result<Option<Header>, Error>
     where
         P: Read + ?Sized,

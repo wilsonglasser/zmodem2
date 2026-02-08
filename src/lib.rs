@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2017-2020 Alexey Arbuzov
-// Copyright (c) 2023-2025 Jarkko Sakkinen
+// Copyright (c) 2023-2026 Jarkko Sakkinen
 
-//! ZMODEM file transfer protocol crate. `zmodem2::State::receive` and `zmodem2::State::send`
-//! provide a synchronous and sequential API for sending and receiving files
-//! with the ZMODEM protocol. Each step corresponds to a single ZMODEM frame
-//! transaction, and the state between the calls is kept in a `zmodem2::State`
-//! instance.
+//! ZMODEM file transfer protocol library. `zmodem2::Sender` and
+//! `zmodem2::Receiver` provide stream alike state machines for sending and
+//! receiving files with the ZMODEM protocol.
+//!
 //! The usage can be described in the high-level with the following flow:
-//! 1. Create `zmodem2::State`.
-//! 2. Call either `state.send(...)` or `state.receive(...)`.
-//! 3. If the returned `zmodem2::Stage` is not yet `zmodem2::Stage::FileEnd`,
-//!    go back to step 2.
+//! 1. Create `zmodem2::Sender` or `zmodem2::Receiver`.
+//! 2. Drain `drain_outgoing()` returned bytes into the wire and call
+//!    `advance_outgoing()` after writing. Then, feed incoming bytes with
+//!    `feed_incoming()`.
+//! 3. In the sender, complete `poll_file()` with `feed_file()` if required
+//!    and handle events via `poll_event()`.
+//! 4. In the receiver, write `drain_file()` returned bytes into storage, and
+//!    call `advance_file()` after writing. Handle events via `poll_event()`.
 
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]

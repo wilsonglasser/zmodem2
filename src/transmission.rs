@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2017-2020 Alexey Arbuzov
-// Copyright (c) 2023-2025 Jarkko Sakkinen
+// Copyright (c) 2023-2026 Jarkko Sakkinen
 
 //! ZMODEM transmission state and logic.
 
@@ -11,18 +11,21 @@ use crate::header::{
     write_slice_escaped, Encoding, Frame, Header, Zrinit, HEADER_PAYLOAD_SIZE, HEADER_SIZE,
     ZACK_HEADER, ZDATA_HEADER, ZEOF_HEADER, ZFIN_HEADER, ZNAK_HEADER, ZRPOS_HEADER, ZRQINIT_HEADER,
 };
-use crate::io::{Read, Seek, Write};
+use crate::io::{Read, Write};
 use crate::string::String;
 use crate::zdle;
 use crate::{ZDLE, ZPAD};
+use core::cmp::min;
 use core::fmt::Write as _;
 
 /// Size of the unescaped subpacket payload. The size is picked from the
 /// original ZMODEM specification.
 const SUBPACKET_MAX_SIZE: usize = 1024;
-
-/// The number of subpackets to stream
 const SUBPACKET_PER_ACK: usize = 10;
+const MAX_HEADER_ESCAPED: usize = 128;
+const MAX_SUBPACKET_ESCAPED: usize = SUBPACKET_MAX_SIZE * 2 + 2 + 8;
+const WIRE_BUF_SIZE: usize = MAX_HEADER_ESCAPED + MAX_SUBPACKET_ESCAPED;
+const RECEIVER_EVENT_QUEUE_CAP: usize = 4;
 
 /// The ZMODEM protocol subpacket type
 #[repr(u8)]
@@ -49,6 +52,26 @@ impl TryFrom<u8> for SubpacketType {
     }
 }
 
+/// A request for file data from the sender.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FileRequest {
+    pub offset: u32,
+    pub len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SenderEvent {
+    FileComplete,
+    SessionComplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReceiverEvent {
+    FileStart,
+    FileComplete,
+    SessionComplete,
+}
+
 /// Internal state for reading a subpacket byte-by-byte
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SubpacketState {
@@ -72,145 +95,56 @@ enum HeaderReadState {
     ReadingData,
 }
 
-/// Send or receive transmission state
-pub struct Transmission {
-    state: State,
-    count: u32,
-    file_name: String,
-    file_size: u32,
-    buf: Buffer<SUBPACKET_MAX_SIZE>,
-    buf_write_offset: usize,
-    data_encoding: Encoding,
-    header_state: HeaderReadState,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SendState {
+    WaitReceiverInit,
+    ReadyForFile,
+    WaitFilePos,
+    NeedFileData,
+    WaitFileAck,
+    WaitFileDone,
+    WaitFinish,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RecvState {
+    SessionBegin,
+    FileBegin,
+    FileReadingMetadata,
+    FileReadingSubpacket,
+    FileWaitingSubpacket,
+    SessionEnd,
+}
+
+struct HeaderReader {
+    state: HeaderReadState,
     zpad_state: ZpadState,
-    header_buf: Buffer<HEADER_SIZE>,
-    header_encoding: Option<Encoding>,
-    header_expected_len: usize,
-    header_escape_pending: bool,
-    subpacket_state: SubpacketState,
-    subpacket_escape_pending: bool,
-    crc_calculator_16: crc::Crc16,
-    crc_calculator_32: crc::Crc32,
-    crc_bytes_read: u8,
-    crc_buf: [u8; 4],
-    crc_escape_pending: bool,
+    buf: Buffer<HEADER_SIZE>,
+    encoding: Option<Encoding>,
+    expected_len: usize,
+    escape_pending: bool,
 }
 
-impl Default for Transmission {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Transmission {
-    /// Create a new transmission context
-    #[must_use]
-    pub const fn new() -> Self {
+impl HeaderReader {
+    const fn new() -> Self {
         Self {
-            state: State::SessionBegin,
-            count: 0,
-            file_name: String::new(),
-            file_size: 0,
-            buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
-            buf_write_offset: 0,
-            data_encoding: Encoding::ZBIN,
-            header_state: HeaderReadState::SeekingZpad,
+            state: HeaderReadState::SeekingZpad,
             zpad_state: ZpadState::Idle,
-            header_buf: Buffer::<HEADER_SIZE>::new(),
-            header_encoding: None,
-            header_expected_len: 0,
-            header_escape_pending: false,
-            subpacket_state: SubpacketState::Idle,
-            subpacket_escape_pending: false,
-            crc_calculator_16: crc::Crc16::new(),
-            crc_calculator_32: crc::Crc32::new(),
-            crc_bytes_read: 0,
-            crc_buf: [0; 4],
-            crc_escape_pending: false,
+            buf: Buffer::<HEADER_SIZE>::new(),
+            encoding: None,
+            expected_len: 0,
+            escape_pending: false,
         }
     }
 
-    /// Create a new transmission context for the first file in a batch.
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn set_first_file(file_name: &str, file_size: u32) -> Result<Self, Error> {
-        Self::set_first_file_u8(file_name.as_bytes(), file_size)
-    }
-
-    /// Create a new transmission context for the first file in a batch.
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn set_first_file_u8(file_name: &[u8], file_size: u32) -> Result<Self, Error> {
-        let mut state = Self::new();
-        state
-            .file_name
-            .extend_from_slice(file_name)
-            .map_err(|_| Error::OutOfMemory)?;
-        state.file_size = file_size;
-        Ok(state)
-    }
-
-    /// Prepares the state for the next file in a batch transfer.
-    ///
-    /// # Errors
-    ///
-    /// * [`Data`](crate::Error::Data) when the `file_name` is invalid.
-    pub fn set_next_file(&mut self, file_name: &str, file_size: u32) -> Result<(), Error> {
-        self.set_next_file_u8(file_name.as_bytes(), file_size)
-    }
-
-    /// Prepares the state for the next file in a batch transfer.
-    ///
-    /// # Errors
-    ///
-    /// * [`Data`](crate::Error::Data) when the `file_name` is invalid.
-    pub fn set_next_file_u8(&mut self, file_name: &[u8], file_size: u32) -> Result<(), Error> {
-        self.file_name.clear();
-        self.file_name
-            .extend_from_slice(file_name)
-            .map_err(|_| Error::OutOfMemory)?;
-        self.file_size = file_size;
-        self.count = 0;
-        self.state = State::FileEnd;
-        self.buf_write_offset = 0;
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn state(&self) -> State {
-        self.state
-    }
-
-    #[must_use]
-    pub fn count(&self) -> u32 {
-        self.count
-    }
-
-    #[must_use]
-    pub fn file_name(&self) -> &[u8] {
-        &self.file_name
-    }
-
-    #[must_use]
-    pub fn file_size(&self) -> u32 {
-        self.file_size
-    }
-
-    fn reset_header_reader(&mut self) {
-        self.header_state = HeaderReadState::SeekingZpad;
+    fn reset(&mut self) {
+        self.state = HeaderReadState::SeekingZpad;
         self.zpad_state = ZpadState::Idle;
-        self.header_encoding = None;
-        self.header_expected_len = 0;
-        self.header_escape_pending = false;
-        self.header_buf.clear();
+        self.encoding = None;
+        self.expected_len = 0;
+        self.escape_pending = false;
+        self.buf.clear();
     }
 
     fn advance_zpad_state(&mut self, byte: u8) -> bool {
@@ -235,18 +169,18 @@ impl Transmission {
         false
     }
 
-    fn read_header<P>(&mut self, port: &mut P) -> Result<Option<Header>, Error>
+    fn read<P>(&mut self, port: &mut P) -> Result<Option<Header>, Error>
     where
         P: Read + ?Sized,
     {
         loop {
-            match self.header_state {
+            match self.state {
                 HeaderReadState::SeekingZpad => {
                     let Some(byte) = port.read_byte()? else {
                         return Ok(None);
                     };
                     if self.advance_zpad_state(byte) {
-                        self.header_state = HeaderReadState::ReadingEncoding;
+                        self.state = HeaderReadState::ReadingEncoding;
                     }
                 }
                 HeaderReadState::ReadingEncoding => {
@@ -256,216 +190,906 @@ impl Transmission {
                     let encoding = match Encoding::try_from(byte) {
                         Ok(encoding) => encoding,
                         Err(e) => {
-                            self.reset_header_reader();
+                            self.reset();
                             return Err(e);
                         }
                     };
-                    self.header_expected_len = Header::read_size(encoding);
-                    self.header_encoding = Some(encoding);
-                    self.header_escape_pending = false;
-                    self.header_buf.clear();
-                    self.header_state = HeaderReadState::ReadingData;
+                    self.expected_len = Header::read_size(encoding);
+                    self.encoding = Some(encoding);
+                    self.escape_pending = false;
+                    self.buf.clear();
+                    self.state = HeaderReadState::ReadingData;
                 }
                 HeaderReadState::ReadingData => {
-                    while self.header_buf.len() < self.header_expected_len {
+                    while self.buf.len() < self.expected_len {
                         let Some(byte) =
-                            read_byte_unescaped_stateful(port, &mut self.header_escape_pending)?
+                            read_byte_unescaped_stateful(port, &mut self.escape_pending)?
                         else {
                             return Ok(None);
                         };
-                        self.header_buf.push(byte).map_err(|_| Error::OutOfMemory)?;
+                        self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
                     }
 
-                    let Some(encoding) = self.header_encoding else {
-                        self.reset_header_reader();
+                    let Some(encoding) = self.encoding else {
+                        self.reset();
                         return Err(Error::MalformedHeader);
                     };
 
-                    let header = match decode_header(encoding, &self.header_buf) {
+                    let header = match decode_header(encoding, &self.buf) {
                         Ok(header) => header,
                         Err(e) => {
-                            self.reset_header_reader();
+                            self.reset();
                             return Err(e);
                         }
                     };
-                    self.reset_header_reader();
+                    self.reset();
                     return Ok(Some(header));
                 }
             }
         }
     }
+}
 
-    /// Sends a file using the ZMODEM file transfer protocol.
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn send<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-        F: Read + Seek + ?Sized,
-    {
-        if self.state == State::SessionBegin {
-            if ZRQINIT_HEADER.write(port)?.is_none() {
-                return Ok(None);
-            }
-            self.state = State::SessionSyncing;
-            return Ok(Some(()));
-        } else if self.state == State::FileEnd {
-            if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none() {
-                return Ok(None);
-            }
-            self.state = State::FileBegin;
-            return Ok(Some(()));
+struct SliceReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SliceReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn consumed(&self) -> usize {
+        self.pos
+    }
+}
+
+impl Read for SliceReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error> {
+        if self.pos >= self.buf.len() {
+            return Ok(None);
+        }
+        let n = min(buf.len(), self.buf.len() - self.pos);
+        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        u32::try_from(n).map(Some).map_err(|_| Error::OutOfMemory)
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>, Error> {
+        if let Some(byte) = self.buf.get(self.pos) {
+            self.pos += 1;
+            Ok(Some(*byte))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+struct BufferWriter<'a, const N: usize> {
+    buf: &'a mut Buffer<N>,
+}
+
+impl<'a, const N: usize> BufferWriter<'a, N> {
+    fn new(buf: &'a mut Buffer<N>) -> Self {
+        Self { buf }
+    }
+}
+
+impl<const N: usize> Write for BufferWriter<'_, N> {
+    fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error> {
+        if self.buf.len() + buf.len() > self.buf.capacity() {
+            return Ok(None);
+        }
+        self.buf
+            .extend_from_slice(buf)
+            .map_err(|_| Error::OutOfMemory)?;
+        Ok(Some(()))
+    }
+
+    fn write_byte(&mut self, value: u8) -> Result<Option<()>, Error> {
+        if self.buf.len() == self.buf.capacity() {
+            return Ok(None);
+        }
+        self.buf.push(value).map_err(|_| Error::OutOfMemory)?;
+        Ok(Some(()))
+    }
+}
+
+struct RxCrc {
+    calc16: crc::Crc16,
+    calc32: crc::Crc32,
+    buf: [u8; 4],
+    bytes_read: u8,
+    escape_pending: bool,
+}
+
+impl RxCrc {
+    fn new() -> Self {
+        Self {
+            calc16: crc::Crc16::new(),
+            calc32: crc::Crc32::new(),
+            buf: [0; 4],
+            bytes_read: 0,
+            escape_pending: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.calc16 = crc::Crc16::new();
+        self.calc32 = crc::Crc32::new();
+        self.bytes_read = 0;
+        self.escape_pending = false;
+    }
+
+    fn update(&mut self, byte: u8, encoding: Encoding) {
+        if encoding == Encoding::ZBIN32 {
+            self.calc32.update_byte(byte);
+        } else {
+            self.calc16.update_byte(byte);
+        }
+    }
+
+    fn process<P: Read + ?Sized>(
+        &mut self,
+        port: &mut P,
+        encoding: Encoding,
+    ) -> Result<Option<()>, Error> {
+        let crc_len = if encoding == Encoding::ZBIN32 { 4 } else { 2 };
+        let Some(byte) = read_byte_unescaped_stateful(port, &mut self.escape_pending)? else {
+            return Ok(None);
+        };
+        self.buf[self.bytes_read as usize] = byte;
+        self.bytes_read += 1;
+
+        if self.bytes_read < crc_len {
+            return Ok(None);
         }
 
-        let header = match self.read_header(port) {
-            Ok(Some(header)) => header,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                if ZNAK_HEADER.write(port)?.is_none() {
-                    return Ok(None);
-                }
-                return Err(e);
+        if encoding == Encoding::ZBIN32 {
+            let expected = self.calc32.finalize().to_le_bytes();
+            if expected != self.buf {
+                return Err(Error::UnexpectedCrc32);
             }
-        };
-
-        match header.frame() {
-            Frame::ZRINIT => {
-                if self.state == State::SessionSyncing {
-                    if write_zfile(port, &mut self.buf, &self.file_name, self.file_size)?.is_none()
-                    {
-                        return Ok(None);
-                    }
-                    self.state = State::FileBegin;
-                } else if self.state == State::FileWaitingSubpacket {
-                    self.state = State::FileEnd;
-                }
-            }
-            Frame::ZRPOS | Frame::ZACK => {
-                if self.state == State::SessionSyncing {
-                    if ZRQINIT_HEADER.write(port)?.is_none() {
-                        return Ok(None);
-                    }
-                } else if self.state == State::FileBegin
-                    || self.state == State::FileWaitingSubpacket
-                {
-                    if write_zdata(port, file, header.count())?.is_none() {
-                        return Ok(None);
-                    }
-                    self.state = State::FileWaitingSubpacket;
-                }
-            }
-            _ => {
-                if self.state == State::SessionSyncing && ZRQINIT_HEADER.write(port)?.is_none() {
-                    return Ok(None);
-                }
+        } else {
+            let expected = self.calc16.finalize().to_be_bytes();
+            if expected != [self.buf[0], self.buf[1]] {
+                return Err(Error::UnexpectedCrc16);
             }
         }
         Ok(Some(()))
     }
+}
 
-    /// Receives a file using the ZMODEM file transfer protocol.
+/// ZMODEM sender state machine.
+pub struct Sender {
+    state: SendState,
+    file_name: String,
+    file_size: u32,
+    has_file: bool,
+    pending_request: Option<FileRequest>,
+    frame_remaining: usize,
+    frame_needs_header: bool,
+    max_subpacket_size: usize,
+    max_subpackets_per_ack: usize,
+    buf: Buffer<SUBPACKET_MAX_SIZE>,
+    outgoing: Buffer<WIRE_BUF_SIZE>,
+    outgoing_offset: usize,
+    header_reader: HeaderReader,
+    pending_event: Option<SenderEvent>,
+    finish_requested: bool,
+}
+
+impl Sender {
+    /// Create a new sender instance.
+    ///
+    /// # Errors
+    ///
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    pub fn new() -> Result<Self, Error> {
+        let mut sender = Self {
+            state: SendState::WaitReceiverInit,
+            file_name: String::new(),
+            file_size: 0,
+            has_file: false,
+            pending_request: None,
+            frame_remaining: 0,
+            frame_needs_header: false,
+            max_subpacket_size: SUBPACKET_MAX_SIZE,
+            max_subpackets_per_ack: SUBPACKET_PER_ACK,
+            buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
+            outgoing: Buffer::<WIRE_BUF_SIZE>::new(),
+            outgoing_offset: 0,
+            header_reader: HeaderReader::new(),
+            pending_event: None,
+            finish_requested: false,
+        };
+        sender.queue_zrqinit()?;
+        Ok(sender)
+    }
+
+    /// Starts sending a file with the provided metadata.
+    ///
+    /// # Errors
+    ///
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    pub fn start_file(&mut self, file_name: &[u8], file_size: u32) -> Result<(), Error> {
+        if matches!(self.state, SendState::Done | SendState::WaitFinish)
+            || (!matches!(
+                self.state,
+                SendState::WaitReceiverInit | SendState::ReadyForFile
+            ))
+        {
+            return Err(Error::Unsupported);
+        }
+
+        self.file_name.clear();
+        self.file_name
+            .extend_from_slice(file_name)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.file_size = file_size;
+        self.has_file = true;
+        self.pending_request = None;
+        self.frame_remaining = 0;
+        self.frame_needs_header = false;
+
+        if self.state == SendState::ReadyForFile {
+            if self.outgoing() {
+                return Err(Error::Unsupported);
+            }
+            self.queue_zfile()?;
+            self.state = SendState::WaitFilePos;
+        }
+        Ok(())
+    }
+
+    /// Requests to finish the session after the current file completes.
+    ///
+    /// # Errors
+    ///
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    pub fn finish_session(&mut self) -> Result<(), Error> {
+        self.finish_requested = true;
+        if self.state == SendState::ReadyForFile {
+            if self.outgoing() {
+                return Err(Error::Unsupported);
+            }
+            self.queue_zfin()?;
+            self.state = SendState::WaitFinish;
+        }
+        Ok(())
+    }
+
+    /// Returns a pending file data request, if any.
+    #[must_use]
+    pub fn poll_file(&self) -> Option<FileRequest> {
+        self.pending_request
+    }
+
+    /// Feeds a chunk of file data for the current request.
+    ///
+    /// # Errors
+    ///
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    pub fn feed_file(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.state != SendState::NeedFileData {
+            return Err(Error::Unsupported);
+        }
+        let Some(request) = self.pending_request else {
+            return Err(Error::Unsupported);
+        };
+
+        if data.is_empty() {
+            return Err(Error::UnexpectedEof);
+        }
+        if data.len() > request.len {
+            return Err(Error::UnexpectedEof);
+        }
+        let remaining = self.file_size.saturating_sub(request.offset) as usize;
+        if data.len() > remaining {
+            return Err(Error::UnexpectedEof);
+        }
+        if self.outgoing() {
+            return Err(Error::Unsupported);
+        }
+
+        let offset = request.offset;
+        let next_offset = offset
+            .checked_add(u32::try_from(data.len()).map_err(|_| Error::OutOfMemory)?)
+            .ok_or(Error::OutOfMemory)?;
+        let remaining_after = self.file_size.saturating_sub(next_offset);
+        let max_len = min(self.max_subpacket_size, remaining_after as usize);
+        let is_last_in_frame =
+            self.frame_remaining <= 1 || data.len() < request.len || remaining_after == 0;
+        let kind = if is_last_in_frame {
+            SubpacketType::ZCRCW
+        } else {
+            SubpacketType::ZCRCG
+        };
+
+        self.queue_zdata(offset, data, kind, self.frame_needs_header)?;
+        self.frame_needs_header = false;
+
+        if self.frame_remaining > 0 {
+            self.frame_remaining -= 1;
+        }
+
+        if is_last_in_frame {
+            self.pending_request = None;
+            self.state = SendState::WaitFileAck;
+            self.frame_remaining = 0;
+        } else {
+            self.pending_request = Some(FileRequest {
+                offset: next_offset,
+                len: max_len,
+            });
+        }
+        Ok(())
+    }
+
+    /// Feeds incoming wire data into the state machine.
+    ///
+    /// Returns the number of bytes consumed.
     ///
     /// # Errors
     ///
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected
-    pub fn receive<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-        F: Write + ?Sized,
-    {
-        if self.state == State::FileReadingSubpacket {
-            return self.receive_subpacket(port, file);
-        }
-        if self.state == State::FileReadingMetadata {
-            return self.receive_subpacket_metadata(port);
+    /// * [`UnexpectedCrc16`](crate::Error::UnexpectedCrc16) or
+    ///   [`UnexpectedCrc32`](crate::Error::UnexpectedCrc32) when corrupted data has been detected
+    pub fn feed_incoming(&mut self, input: &[u8]) -> Result<usize, Error> {
+        let mut reader = SliceReader::new(input);
+
+        loop {
+            if self.outgoing() || self.state == SendState::Done || self.pending_request.is_some() {
+                break;
+            }
+
+            let before = reader.consumed();
+            let header = match self.header_reader.read(&mut reader) {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = self.queue_nak();
+                    return Err(e);
+                }
+            };
+
+            self.handle_header(header)?;
+
+            if reader.consumed() == before || reader.consumed() == input.len() {
+                break;
+            }
         }
 
-        if self.state == State::SessionBegin && write_zrinit(port)?.is_none() {
-            return Ok(None);
+        Ok(reader.consumed())
+    }
+
+    /// Returns pending outgoing bytes.
+    #[must_use]
+    pub fn drain_outgoing(&self) -> &[u8] {
+        &self.outgoing[self.outgoing_offset..]
+    }
+
+    /// Advances the outgoing cursor by `n` bytes.
+    pub fn advance_outgoing(&mut self, n: usize) {
+        let remaining = self.outgoing.len().saturating_sub(self.outgoing_offset);
+        let n = min(n, remaining);
+        self.outgoing_offset += n;
+        if self.outgoing_offset >= self.outgoing.len() {
+            self.outgoing.clear();
+            self.outgoing_offset = 0;
+        }
+    }
+
+    /// Returns the next pending sender event.
+    pub fn poll_event(&mut self) -> Option<SenderEvent> {
+        self.pending_event.take()
+    }
+
+    fn outgoing(&self) -> bool {
+        self.outgoing_offset < self.outgoing.len()
+    }
+
+    fn queue_writer(&mut self) -> Result<BufferWriter<'_, WIRE_BUF_SIZE>, Error> {
+        if self.outgoing() {
+            return Err(Error::Unsupported);
+        }
+        Ok(BufferWriter::new(&mut self.outgoing))
+    }
+
+    fn queue_zrqinit(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZRQINIT_HEADER.write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zfile(&mut self) -> Result<(), Error> {
+        let file_size = self.file_size;
+        let file_name = &self.file_name;
+        let mut writer = BufferWriter::new(&mut self.outgoing);
+        if write_zfile(&mut writer, &mut self.buf, file_name, file_size)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zdata(
+        &mut self,
+        offset: u32,
+        data: &[u8],
+        kind: SubpacketType,
+        include_header: bool,
+    ) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if include_header
+            && ZDATA_HEADER
+                .with_count(offset)
+                .write(&mut writer)?
+                .is_none()
+        {
+            return Err(Error::OutOfMemory);
+        }
+        if write_subpacket(&mut writer, Encoding::ZBIN32, kind, data)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zeof(&mut self, offset: u32) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZEOF_HEADER.with_count(offset).write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zfin(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZFIN_HEADER.write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_nak(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZNAK_HEADER.write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_oo(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if writer.write_byte(b'O')?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        if writer.write_byte(b'O')?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn handle_header(&mut self, header: Header) -> Result<(), Error> {
+        match header.frame() {
+            Frame::ZRINIT => self.on_zrinit(header),
+            Frame::ZRPOS | Frame::ZACK => self.on_zrpos(header.count()),
+            Frame::ZFIN => self.on_zfin(),
+            _ => {
+                if self.state == SendState::WaitReceiverInit {
+                    self.queue_zrqinit()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn on_zrinit(&mut self, header: Header) -> Result<(), Error> {
+        self.update_receiver_caps(header);
+        match self.state {
+            SendState::WaitReceiverInit => {
+                if self.has_file {
+                    self.queue_zfile()?;
+                    self.state = SendState::WaitFilePos;
+                } else {
+                    self.state = SendState::ReadyForFile;
+                    if self.finish_requested {
+                        self.queue_zfin()?;
+                        self.state = SendState::WaitFinish;
+                    }
+                }
+            }
+            SendState::WaitFileDone => {
+                self.pending_event = Some(SenderEvent::FileComplete);
+                self.has_file = false;
+                if self.finish_requested {
+                    self.queue_zfin()?;
+                    self.state = SendState::WaitFinish;
+                } else {
+                    self.state = SendState::ReadyForFile;
+                }
+            }
+            SendState::WaitFinish => {
+                self.queue_oo()?;
+                self.state = SendState::Done;
+                self.pending_event = Some(SenderEvent::SessionComplete);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn update_receiver_caps(&mut self, header: Header) {
+        let flags = header.count().to_le_bytes();
+        let rx_buf_size = u16::from_le_bytes([flags[0], flags[1]]) as usize;
+        let caps = flags[2] | flags[3];
+        let can_ovio = (caps & Zrinit::CANOVIO.bits()) != 0;
+
+        if rx_buf_size == 0 {
+            self.max_subpacket_size = SUBPACKET_MAX_SIZE;
+            self.max_subpackets_per_ack = if can_ovio { SUBPACKET_PER_ACK } else { 1 };
+            return;
         }
 
-        let header = match self.read_header(port) {
-            Ok(Some(header)) => header,
-            Ok(None) => return Ok(None),
-            Err(Error::Read(err)) => {
-                if self.state == State::FileBegin {
-                    self.state = State::SessionEnd;
-                    return Ok(Some(()));
-                }
-                return Err(Error::Read(err));
+        self.max_subpacket_size = min(SUBPACKET_MAX_SIZE, rx_buf_size);
+        if !can_ovio {
+            self.max_subpackets_per_ack = 1;
+            return;
+        }
+
+        let subpackets = rx_buf_size / self.max_subpacket_size;
+        self.max_subpackets_per_ack = if subpackets == 0 { 1 } else { subpackets };
+    }
+
+    fn on_zrpos(&mut self, offset: u32) -> Result<(), Error> {
+        match self.state {
+            SendState::WaitReceiverInit => {
+                self.queue_zrqinit()?;
             }
-            Err(e) => {
-                if ZNAK_HEADER.write(port)?.is_none() {
-                    return Ok(None);
+            SendState::WaitFilePos | SendState::WaitFileAck | SendState::NeedFileData => {
+                if offset >= self.file_size {
+                    self.queue_zeof(offset)?;
+                    self.state = SendState::WaitFileDone;
+                    self.pending_request = None;
+                } else {
+                    let remaining = (self.file_size - offset) as usize;
+                    let max_subpackets = remaining.div_ceil(self.max_subpacket_size);
+                    self.frame_remaining = min(self.max_subpackets_per_ack, max_subpackets);
+                    self.frame_needs_header = true;
+                    let len = min(self.max_subpacket_size, remaining);
+                    self.pending_request = Some(FileRequest { offset, len });
+                    self.state = SendState::NeedFileData;
                 }
-                return Err(e);
             }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_zfin(&mut self) -> Result<(), Error> {
+        if self.state == SendState::WaitFinish {
+            self.queue_oo()?;
+            self.state = SendState::Done;
+            self.pending_event = Some(SenderEvent::SessionComplete);
+        }
+        Ok(())
+    }
+}
+
+/// ZMODEM receiver state machine.
+pub struct Receiver {
+    state: RecvState,
+    count: u32,
+    file_name: String,
+    file_size: u32,
+    buf: Buffer<SUBPACKET_MAX_SIZE>,
+    buf_write_offset: usize,
+    data_encoding: Encoding,
+    header_reader: HeaderReader,
+    subpacket_state: SubpacketState,
+    subpacket_escape_pending: bool,
+    crc: RxCrc,
+    outgoing: Buffer<WIRE_BUF_SIZE>,
+    outgoing_offset: usize,
+    pending_events: [Option<ReceiverEvent>; RECEIVER_EVENT_QUEUE_CAP],
+    pending_event_head: usize,
+    pending_event_len: usize,
+}
+
+impl Receiver {
+    /// Create a new receiver instance.
+    ///
+    /// # Errors
+    ///
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    pub fn new() -> Result<Self, Error> {
+        let mut receiver = Self {
+            state: RecvState::SessionBegin,
+            count: 0,
+            file_name: String::new(),
+            file_size: 0,
+            buf: Buffer::<SUBPACKET_MAX_SIZE>::new(),
+            buf_write_offset: 0,
+            data_encoding: Encoding::ZBIN,
+            header_reader: HeaderReader::new(),
+            subpacket_state: SubpacketState::Idle,
+            subpacket_escape_pending: false,
+            crc: RxCrc::new(),
+            outgoing: Buffer::<WIRE_BUF_SIZE>::new(),
+            outgoing_offset: 0,
+            pending_events: [None; RECEIVER_EVENT_QUEUE_CAP],
+            pending_event_head: 0,
+            pending_event_len: 0,
+        };
+        receiver.queue_zrinit()?;
+        Ok(receiver)
+    }
+
+    /// Feeds incoming wire data into the state machine.
+    ///
+    /// Returns the number of bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`UnexpectedCrc16`](crate::Error::UnexpectedCrc16) or
+    ///   [`UnexpectedCrc32`](crate::Error::UnexpectedCrc32) when corrupted data has been detected
+    pub fn feed_incoming(&mut self, input: &[u8]) -> Result<usize, Error> {
+        let mut reader = SliceReader::new(input);
+
+        loop {
+            if self.outgoing() || !self.drain_file().is_empty() || self.pending_events_full() {
+                break;
+            }
+
+            let before = reader.consumed();
+
+            if matches!(
+                self.state,
+                RecvState::FileReadingSubpacket | RecvState::FileReadingMetadata
+            ) {
+                match self.process_subpacket(&mut reader) {
+                    Ok(Some(())) => {
+                        if self.outgoing()
+                            || !self.drain_file().is_empty()
+                            || self.pending_events_full()
+                        {
+                            break;
+                        }
+                        if reader.consumed() == before {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let header = match self.header_reader.read(&mut reader) {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = self.queue_nak();
+                    return Err(e);
+                }
+            };
+
+            self.handle_header(header)?;
+
+            if self.pending_events_full() {
+                break;
+            }
+
+            if reader.consumed() == before || reader.consumed() == input.len() {
+                break;
+            }
+        }
+
+        Ok(reader.consumed())
+    }
+
+    /// Returns pending outgoing bytes.
+    #[must_use]
+    pub fn drain_outgoing(&self) -> &[u8] {
+        &self.outgoing[self.outgoing_offset..]
+    }
+
+    /// Advances the outgoing cursor by `n` bytes.
+    pub fn advance_outgoing(&mut self, n: usize) {
+        let remaining = self.outgoing.len().saturating_sub(self.outgoing_offset);
+        let n = min(n, remaining);
+        self.outgoing_offset += n;
+        if self.outgoing_offset >= self.outgoing.len() {
+            self.outgoing.clear();
+            self.outgoing_offset = 0;
+        }
+    }
+
+    /// Returns pending file data bytes.
+    #[must_use]
+    pub fn drain_file(&self) -> &[u8] {
+        match self.subpacket_state {
+            SubpacketState::Writing(_) => &self.buf[self.buf_write_offset..],
+            _ => &[],
+        }
+    }
+
+    /// Advances the file output cursor by `n` bytes.
+    ///
+    /// # Errors
+    ///
+    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    pub fn advance_file(&mut self, n: usize) -> Result<(), Error> {
+        let SubpacketState::Writing(packet) = self.subpacket_state else {
+            return Ok(());
         };
 
+        let remaining = self.buf.len().saturating_sub(self.buf_write_offset);
+        let n = min(n, remaining);
+        self.buf_write_offset = self
+            .buf_write_offset
+            .checked_add(n)
+            .ok_or(Error::OutOfMemory)?;
+
+        if self.buf_write_offset < self.buf.len() {
+            return Ok(());
+        }
+
+        self.finish_subpacket(packet)
+    }
+
+    /// Returns the next pending receiver event.
+    pub fn poll_event(&mut self) -> Option<ReceiverEvent> {
+        self.pop_event()
+    }
+
+    #[must_use]
+    pub fn file_name(&self) -> &[u8] {
+        &self.file_name
+    }
+
+    #[must_use]
+    pub fn file_size(&self) -> u32 {
+        self.file_size
+    }
+
+    fn outgoing(&self) -> bool {
+        self.outgoing_offset < self.outgoing.len()
+    }
+
+    fn pending_events_full(&self) -> bool {
+        self.pending_event_len >= RECEIVER_EVENT_QUEUE_CAP
+    }
+
+    fn push_event(&mut self, event: ReceiverEvent) -> Result<(), Error> {
+        if self.pending_events_full() {
+            return Err(Error::OutOfMemory);
+        }
+        let index = (self.pending_event_head + self.pending_event_len) % RECEIVER_EVENT_QUEUE_CAP;
+        self.pending_events[index] = Some(event);
+        self.pending_event_len += 1;
+        Ok(())
+    }
+
+    fn pop_event(&mut self) -> Option<ReceiverEvent> {
+        if self.pending_event_len == 0 {
+            return None;
+        }
+        let event = self.pending_events[self.pending_event_head].take();
+        self.pending_event_head = (self.pending_event_head + 1) % RECEIVER_EVENT_QUEUE_CAP;
+        self.pending_event_len -= 1;
+        event
+    }
+
+    fn queue_writer(&mut self) -> Result<BufferWriter<'_, WIRE_BUF_SIZE>, Error> {
+        if self.outgoing() {
+            return Err(Error::Unsupported);
+        }
+        Ok(BufferWriter::new(&mut self.outgoing))
+    }
+
+    fn queue_zrinit(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if write_zrinit(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zrpos(&mut self, count: u32) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZRPOS_HEADER.with_count(count).write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zack(&mut self) -> Result<(), Error> {
+        let count = self.count;
+        let mut writer = self.queue_writer()?;
+        if ZACK_HEADER.with_count(count).write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_zfin(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZFIN_HEADER.write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn queue_nak(&mut self) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if ZNAK_HEADER.write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn handle_header(&mut self, header: Header) -> Result<(), Error> {
         match header.frame() {
+            Frame::ZRQINIT => {
+                if self.state == RecvState::SessionBegin {
+                    self.queue_zrinit()?;
+                }
+            }
             Frame::ZFILE => {
-                if self.state == State::SessionBegin || self.state == State::FileBegin {
+                if self.state == RecvState::SessionBegin || self.state == RecvState::FileBegin {
                     self.data_encoding = header.encoding();
-                    self.state = State::FileReadingMetadata;
+                    self.state = RecvState::FileReadingMetadata;
                     self.subpacket_state = SubpacketState::Reading;
                     self.subpacket_escape_pending = false;
-                    self.crc_escape_pending = false;
-                    self.crc_calculator_16 = crc::Crc16::new();
-                    self.crc_calculator_32 = crc::Crc32::new();
+                    self.crc.reset();
                     self.buf.clear();
                     self.buf_write_offset = 0;
                 }
             }
             Frame::ZDATA => {
-                if self.state == State::SessionBegin {
-                    if write_zrinit(port)?.is_none() {
-                        return Ok(None);
-                    }
-                } else if self.state == State::FileBegin
-                    || self.state == State::FileWaitingSubpacket
+                if self.state == RecvState::SessionBegin {
+                    self.queue_zrinit()?;
+                } else if self.state == RecvState::FileBegin
+                    || self.state == RecvState::FileWaitingSubpacket
                 {
                     if header.count() != self.count {
-                        if ZRPOS_HEADER.with_count(self.count).write(port)?.is_none() {
-                            return Ok(None);
-                        }
-                        return Ok(Some(()));
+                        self.queue_zrpos(self.count)?;
+                        return Ok(());
                     }
                     self.data_encoding = header.encoding();
-                    self.state = State::FileReadingSubpacket;
+                    self.state = RecvState::FileReadingSubpacket;
                     self.subpacket_state = SubpacketState::Reading;
                     self.subpacket_escape_pending = false;
-                    self.crc_escape_pending = false;
-                    self.crc_calculator_16 = crc::Crc16::new();
-                    self.crc_calculator_32 = crc::Crc32::new();
+                    self.crc.reset();
                     self.buf.clear();
                     self.buf_write_offset = 0;
                 }
             }
             Frame::ZEOF => {
-                if self.state == State::FileWaitingSubpacket && header.count() == self.count {
-                    if write_zrinit(port)?.is_none() {
-                        return Ok(None);
-                    }
-                    self.state = State::FileBegin;
+                if self.state == RecvState::FileWaitingSubpacket && header.count() == self.count {
+                    self.queue_zrinit()?;
+                    self.state = RecvState::FileBegin;
+                    self.push_event(ReceiverEvent::FileComplete)?;
                 }
             }
             Frame::ZFIN => {
-                if self.state == State::FileWaitingSubpacket || self.state == State::FileBegin {
-                    if ZFIN_HEADER.write(port)?.is_none() {
-                        return Ok(None);
-                    }
-                    self.state = State::SessionEnd;
+                if self.state == RecvState::FileWaitingSubpacket
+                    || self.state == RecvState::FileBegin
+                {
+                    self.queue_zfin()?;
+                    self.state = RecvState::SessionEnd;
+                    self.push_event(ReceiverEvent::SessionComplete)?;
                 }
             }
             _ => {}
         }
-        Ok(Some(()))
+        Ok(())
     }
 
     /// Parses the file info buffer after a ZFILE subpacket is received.
@@ -501,27 +1125,16 @@ impl Transmission {
     /// Handles reading a single byte for the `SubpacketState::Reading` state.
     fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
-        P: Read + Write + ?Sized,
+        P: Read + ?Sized,
     {
         let handle_followup = |this: &mut Self, byte: u8| -> Result<Option<()>, Error> {
             if let Ok(packet) = SubpacketType::try_from(byte) {
-                if this.data_encoding == Encoding::ZBIN32 {
-                    this.crc_calculator_32.update_byte(packet as u8);
-                } else {
-                    this.crc_calculator_16.update_byte(packet as u8);
-                }
+                this.crc.update(packet as u8, this.data_encoding);
                 this.subpacket_state = SubpacketState::Crc(packet);
-                this.crc_bytes_read = 0;
-                this.crc_buf = [0; 4];
-                this.crc_escape_pending = false;
             } else {
                 let unescaped = zdle::UNZDLE_TABLE[byte as usize];
                 this.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
-                if this.data_encoding == Encoding::ZBIN32 {
-                    this.crc_calculator_32.update_byte(unescaped);
-                } else {
-                    this.crc_calculator_16.update_byte(unescaped);
-                }
+                this.crc.update(unescaped, this.data_encoding);
             }
             Ok(Some(()))
         };
@@ -546,233 +1159,77 @@ impl Transmission {
         }
 
         self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
-        if self.data_encoding == Encoding::ZBIN32 {
-            self.crc_calculator_32.update_byte(byte);
-        } else {
-            self.crc_calculator_16.update_byte(byte);
-        }
+        self.crc.update(byte, self.data_encoding);
         Ok(Some(()))
     }
 
-    /// Handles the byte-by-byte reading of a ZFILE info subpacket.
-    fn receive_subpacket_metadata<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
+    fn process_subpacket<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
     where
-        P: Read + Write + ?Sized,
-    {
-        match self.subpacket_state {
-            SubpacketState::Reading => self.receive_subpacket_data_byte(port),
-            SubpacketState::Crc(_) => {
-                let crc_len = if self.data_encoding == Encoding::ZBIN32 {
-                    4
-                } else {
-                    2
-                };
-
-                let Some(byte) = read_byte_unescaped_stateful(port, &mut self.crc_escape_pending)?
-                else {
-                    return Ok(None);
-                };
-                self.crc_buf[self.crc_bytes_read as usize] = byte;
-                self.crc_bytes_read += 1;
-
-                if self.crc_bytes_read < crc_len {
-                    return Ok(Some(()));
-                }
-
-                if self.data_encoding == Encoding::ZBIN32 {
-                    let expected_crc = self.crc_calculator_32.finalize().to_le_bytes();
-                    if expected_crc != self.crc_buf {
-                        return Err(Error::UnexpectedCrc32);
-                    }
-                } else {
-                    let expected_crc = self.crc_calculator_16.finalize().to_be_bytes();
-                    if expected_crc != [self.crc_buf[0], self.crc_buf[1]] {
-                        return Err(Error::UnexpectedCrc16);
-                    }
-                }
-
-                self.parse_zfile_buf()?;
-                self.buf.clear();
-                self.buf_write_offset = 0;
-                self.crc_calculator_16 = crc::Crc16::new();
-                self.crc_calculator_32 = crc::Crc32::new();
-                self.subpacket_escape_pending = false;
-                self.crc_escape_pending = false;
-
-                if ZRPOS_HEADER.with_count(0).write(port)?.is_none() {
-                    return Ok(None);
-                }
-
-                self.state = State::FileBegin;
-                self.subpacket_state = SubpacketState::Idle;
-                Ok(Some(()))
-            }
-            SubpacketState::Idle | SubpacketState::Writing(_) => Err(Error::Unsupported),
-        }
-    }
-
-    /// Handles the byte-by-byte reading of a ZDATA subpacket.
-    fn receive_subpacket<P, F>(&mut self, port: &mut P, file: &mut F) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-        F: Write + ?Sized,
+        P: Read + ?Sized,
     {
         match self.subpacket_state {
             SubpacketState::Reading => self.receive_subpacket_data_byte(port),
             SubpacketState::Crc(packet) => {
-                let crc_len = if self.data_encoding == Encoding::ZBIN32 {
-                    4
-                } else {
-                    2
-                };
-
-                let Some(byte) = read_byte_unescaped_stateful(port, &mut self.crc_escape_pending)?
-                else {
+                if self.crc.process(port, self.data_encoding)?.is_none() {
                     return Ok(None);
-                };
-                self.crc_buf[self.crc_bytes_read as usize] = byte;
-                self.crc_bytes_read += 1;
-
-                if self.crc_bytes_read < crc_len {
-                    return Ok(Some(()));
                 }
 
-                if self.data_encoding == Encoding::ZBIN32 {
-                    let expected_crc = self.crc_calculator_32.finalize().to_le_bytes();
-                    if expected_crc != self.crc_buf {
-                        return Err(Error::UnexpectedCrc32);
-                    }
+                if self.state == RecvState::FileReadingMetadata {
+                    self.parse_zfile_buf()?;
+                    self.buf.clear();
+                    self.buf_write_offset = 0;
+                    self.crc.reset();
+                    self.subpacket_escape_pending = false;
+
+                    self.queue_zrpos(0)?;
+
+                    self.state = RecvState::FileBegin;
+                    self.subpacket_state = SubpacketState::Idle;
+                    self.push_event(ReceiverEvent::FileStart)?;
                 } else {
-                    let expected_crc = self.crc_calculator_16.finalize().to_be_bytes();
-                    if expected_crc != [self.crc_buf[0], self.crc_buf[1]] {
-                        return Err(Error::UnexpectedCrc16);
-                    }
-                }
-
-                self.subpacket_state = SubpacketState::Writing(packet);
-                self.buf_write_offset = 0;
-                Ok(Some(()))
-            }
-            SubpacketState::Writing(packet) => {
-                while self.buf_write_offset < self.buf.len() {
-                    let remaining = &self.buf[self.buf_write_offset..];
-                    let Some(bytes_written) = file.write(remaining)? else {
-                        return Ok(None);
-                    };
-                    if bytes_written == 0 {
-                        return Err(Error::UnexpectedEof);
-                    }
-                    let bytes_written =
-                        usize::try_from(bytes_written).map_err(|_| Error::OutOfMemory)?;
-                    self.buf_write_offset = self
-                        .buf_write_offset
-                        .checked_add(bytes_written)
-                        .ok_or(Error::OutOfMemory)?;
-                }
-                self.count += u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
-                self.buf.clear();
-                self.buf_write_offset = 0;
-                self.crc_calculator_16 = crc::Crc16::new();
-                self.crc_calculator_32 = crc::Crc32::new();
-
-                match packet {
-                    SubpacketType::ZCRCW => {
-                        if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
-                            return Ok(None);
-                        }
-                        self.state = State::FileWaitingSubpacket;
-                        self.subpacket_state = SubpacketState::Idle;
-                        self.subpacket_escape_pending = false;
-                        self.crc_escape_pending = false;
-                    }
-                    SubpacketType::ZCRCQ => {
-                        if ZACK_HEADER.with_count(self.count).write(port)?.is_none() {
-                            return Ok(None);
-                        }
-                        self.subpacket_state = SubpacketState::Reading;
-                        self.subpacket_escape_pending = false;
-                        self.crc_escape_pending = false;
-                    }
-                    SubpacketType::ZCRCG => {
-                        self.subpacket_state = SubpacketState::Reading;
-                        self.subpacket_escape_pending = false;
-                        self.crc_escape_pending = false;
-                    }
-                    SubpacketType::ZCRCE => {
-                        self.state = State::FileWaitingSubpacket;
-                        self.subpacket_state = SubpacketState::Idle;
-                        self.subpacket_escape_pending = false;
-                        self.crc_escape_pending = false;
+                    self.subpacket_state = SubpacketState::Writing(packet);
+                    self.buf_write_offset = 0;
+                    if self.buf.is_empty() {
+                        self.finish_subpacket(packet)?;
                     }
                 }
                 Ok(Some(()))
             }
+            SubpacketState::Writing(_) => Ok(Some(())),
             SubpacketState::Idle => Err(Error::Unsupported),
         }
     }
 
-    /// Send ZFIN.
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected.
-    pub fn finish<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
-    where
-        P: Read + Write + ?Sized,
-    {
-        if self.state != State::SessionTeardown {
-            if ZFIN_HEADER.write(port)?.is_none() {
-                return Ok(None);
-            }
-            self.state = State::SessionTeardown;
-            return Ok(Some(()));
-        }
+    fn finish_subpacket(&mut self, packet: SubpacketType) -> Result<(), Error> {
+        self.count += u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
+        self.buf.clear();
+        self.buf_write_offset = 0;
+        self.crc.reset();
 
-        let frame = match self.read_header(port) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                if ZNAK_HEADER.write(port)?.is_none() {
-                    return Ok(None);
-                }
-                return Err(e);
+        match packet {
+            SubpacketType::ZCRCW => {
+                self.queue_zack()?;
+                self.state = RecvState::FileWaitingSubpacket;
+                self.subpacket_state = SubpacketState::Idle;
+                self.subpacket_escape_pending = false;
             }
-        };
-
-        match frame.frame() {
-            Frame::ZFIN | Frame::ZRINIT => {
-                if port.write_byte(b'O')?.is_none() {
-                    return Ok(None);
-                }
-                if port.write_byte(b'O')?.is_none() {
-                    return Ok(None);
-                }
-                self.state = State::SessionEnd;
+            SubpacketType::ZCRCQ => {
+                self.queue_zack()?;
+                self.subpacket_state = SubpacketState::Reading;
+                self.subpacket_escape_pending = false;
             }
-            _ => {
-                if ZFIN_HEADER.write(port)?.is_none() {
-                    return Ok(None);
-                }
+            SubpacketType::ZCRCG => {
+                self.subpacket_state = SubpacketState::Reading;
+                self.subpacket_escape_pending = false;
+            }
+            SubpacketType::ZCRCE => {
+                self.state = RecvState::FileWaitingSubpacket;
+                self.subpacket_state = SubpacketState::Idle;
+                self.subpacket_escape_pending = false;
             }
         }
-
-        Ok(Some(()))
+        Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum State {
-    FileBegin,
-    FileEnd,
-    FileReadingMetadata,
-    FileReadingSubpacket,
-    FileWaitingSubpacket,
-    SessionBegin,
-    SessionEnd,
-    SessionSyncing,
-    SessionTeardown,
 }
 
 fn read_byte_unescaped_stateful<P>(port: &mut P, pending: &mut bool) -> Result<Option<u8>, Error>
@@ -846,7 +1303,7 @@ fn write_zrinit<P>(port: &mut P) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
-    let zrinit = Zrinit::CANFDX | Zrinit::CANOVIO | Zrinit::CANFC32;
+    let zrinit = Zrinit::CANFDX | Zrinit::CANFC32;
     let buffer_size = u16::try_from(SUBPACKET_MAX_SIZE)
         .map_err(|_| Error::Unsupported)?
         .to_le_bytes();
@@ -904,70 +1361,12 @@ where
     write_subpacket(port, Encoding::ZBIN32, SubpacketType::ZCRCW, buf)
 }
 
-/// Writes ZDATA
-fn write_zdata<P, F>(port: &mut P, file: &mut F, offset: u32) -> Result<Option<()>, Error>
-where
-    P: Read + Write + ?Sized,
-    F: Read + Seek + ?Sized,
-{
-    let mut offset = offset;
-    let mut local_buf = [0u8; SUBPACKET_MAX_SIZE];
-    let read_buf = &mut local_buf[..SUBPACKET_MAX_SIZE];
-
-    let Some(new_offset) = file.seek(offset)? else {
-        return Ok(None);
-    };
-    if new_offset != offset {
-        return Err(Error::UnexpectedEof);
-    }
-
-    let Some(count) = file.read(read_buf)? else {
-        return Ok(None);
-    };
-    let mut count = count as usize;
-
-    if count == 0 {
-        ZEOF_HEADER.with_count(offset).write(port)?;
-        return Ok(Some(()));
-    }
-    if ZDATA_HEADER.with_count(offset).write(port)?.is_none() {
-        return Ok(None);
-    }
-    for _ in 1..SUBPACKET_PER_ACK {
-        if write_subpacket(
-            port,
-            Encoding::ZBIN32,
-            SubpacketType::ZCRCG,
-            &read_buf[..count],
-        )?
-        .is_none()
-        {
-            return Ok(None);
-        }
-        offset += u32::try_from(count).map_err(|_| Error::OutOfMemory)?;
-
-        let Some(new_count) = file.read(read_buf)? else {
-            return Ok(None);
-        };
-        count = new_count as usize;
-        if count < read_buf.len() {
-            break;
-        }
-    }
-    write_subpacket(
-        port,
-        Encoding::ZBIN32,
-        SubpacketType::ZCRCW,
-        &read_buf[..count],
-    )
-}
-
 /// Writes a subpacket.
 ///
 /// # Errors
 ///
-/// This function returns `Error::Write` on an I/O error or `Error::Data` on
-/// a data validation error.
+/// This function returns `Error::Read` or `Error::Write` on an I/O error, or
+/// `Error::Unsupported` if `ZHEX` encoding is requested.
 fn write_subpacket<P>(
     port: &mut P,
     encoding: Encoding,

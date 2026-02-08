@@ -11,7 +11,6 @@ pub trait Write {
     ///
     /// # Errors
     ///
-    /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial
     /// port.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the
@@ -31,7 +30,6 @@ pub trait Write {
     ///
     /// # Errors
     ///
-    /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial
     /// port.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the
@@ -44,7 +42,6 @@ pub trait Write {
     ///
     /// # Errors
     ///
-    /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial
     /// port.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the
@@ -62,7 +59,6 @@ pub trait Read {
     ///
     /// # Errors
     ///
-    /// * [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
     /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
     fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error>;
@@ -73,7 +69,6 @@ pub trait Read {
     ///
     /// # Errors
     ///
-    /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
     fn read_byte(&mut self) -> Result<Option<u8>, Error>;
@@ -85,7 +80,6 @@ pub trait Seek {
     ///
     /// # Errors
     ///
-    /// [`Data`](crate::Error::Data) when corrupted data has been detected.
     /// [`Read`](crate::Error::Read) when the read I/O fails with the serial port.
     /// [`Write`](crate::Error::Write) when the write I/O fails with the serial port.
     fn seek(&mut self, offset: u32) -> Result<Option<u32>, Error>;

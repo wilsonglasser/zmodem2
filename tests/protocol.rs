@@ -1,80 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2017-2020 Alexey Arbuzov
-// Copyright (c) 2023-2025 Jarkko Sakkinen
+// Copyright (c) 2023-2026 Jarkko Sakkinen
 
-use core::cmp;
 use rstest::rstest;
-use zmodem2::{Encoding, Error, Frame, Header, Read, State, Transmission, Write, XON, ZDLE, ZPAD};
-
-struct MockPort<'a> {
-    input: &'a [u8],
-    output: Vec<u8>,
-    would_block: bool,
-    block_next: bool,
-}
-
-impl<'a> MockPort<'a> {
-    fn new(input: &'a [u8]) -> Self {
-        Self {
-            input,
-            output: Vec::new(),
-            would_block: false,
-            block_next: false,
-        }
-    }
-
-    fn with_would_block(mut self) -> Self {
-        self.would_block = true;
-        self
-    }
-}
-
-impl<'a> Read for MockPort<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error> {
-        if self.would_block && self.block_next {
-            self.block_next = false;
-            return Ok(None);
-        }
-        if self.input.is_empty() {
-            return Ok(None);
-        }
-        let n = cmp::min(self.input.len(), buf.len());
-        buf[..n].copy_from_slice(&self.input[..n]);
-        self.input = &self.input[n..];
-        if self.would_block {
-            self.block_next = true;
-        }
-        Ok(Some(n as u32))
-    }
-
-    fn read_byte(&mut self) -> Result<Option<u8>, Error> {
-        if self.would_block && self.block_next {
-            self.block_next = false;
-            return Ok(None);
-        }
-        if let Some((&first, rest)) = self.input.split_first() {
-            self.input = rest;
-            if self.would_block {
-                self.block_next = true;
-            }
-            Ok(Some(first))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl<'a> Write for MockPort<'a> {
-    fn write_all(&mut self, buf: &[u8]) -> Result<Option<()>, Error> {
-        self.output.extend_from_slice(buf);
-        Ok(Some(()))
-    }
-
-    fn write_byte(&mut self, value: u8) -> Result<Option<()>, Error> {
-        self.output.push(value);
-        Ok(Some(()))
-    }
-}
+use zmodem2::{Encoding, Frame, Header, Receiver, ReceiverEvent, Sender, XON, ZDLE, ZPAD};
 
 #[rstest]
 #[case(Encoding::ZBIN, Frame::ZRQINIT, &[0; 4], &[ZPAD, ZDLE, Encoding::ZBIN as u8, 0, 0, 0, 0, 0, 0, 0])]
@@ -111,40 +40,61 @@ pub fn test_header_read(
 
 #[test]
 fn test_receive_malformed_header() {
-    let mut mock_port = MockPort::new(b"malformed data");
-    let mut file = vec![];
-    let mut state = Transmission::new();
+    let mut receiver = Receiver::new().unwrap();
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
 
-    let result = state.receive(&mut mock_port, &mut file);
-    assert!(matches!(result, Ok(None)));
+    let input = b"malformed data";
+    let consumed = receiver.feed_incoming(input).unwrap();
+
+    assert_eq!(consumed, input.len());
+    assert!(receiver.drain_outgoing().is_empty());
+    assert!(receiver.drain_file().is_empty());
+    assert!(receiver.poll_event().is_none());
 }
 
 #[test]
 fn test_receive_zfile_with_non_utf8_name() {
     let file_name = b"bad\x80name";
     let file_size = 123;
-    let mut sender = Transmission::new();
-    sender.set_next_file_u8(file_name, file_size).unwrap();
-    let mut send_port = MockPort::new(&[]);
-    let mut file = std::io::Cursor::new(&[]);
-    assert!(sender.send(&mut send_port, &mut file) == Ok(Some(())));
 
-    let wire = send_port.output;
-    let mut recv_port = MockPort::new(&wire).with_would_block();
-    let mut sink = Vec::new();
-    let mut receiver = Transmission::new();
+    let mut sender = Sender::new().unwrap();
+    sender.start_file(file_name, file_size).unwrap();
+    sender.advance_outgoing(sender.drain_outgoing().len());
 
+    let zrinit = Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0; 4]);
+    let mut zrinit_bytes = Vec::new();
+    zrinit.write(&mut zrinit_bytes).unwrap();
+    let consumed = sender.feed_incoming(&zrinit_bytes).unwrap();
+    assert!(consumed > 0 && consumed <= zrinit_bytes.len());
+
+    let wire = sender.drain_outgoing().to_vec();
+    sender.advance_outgoing(wire.len());
+
+    let mut receiver = Receiver::new().unwrap();
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
+
+    let mut input = wire.as_slice();
+    let mut got_start = false;
     for _ in 0..(wire.len() * 4) {
-        match receiver.receive(&mut recv_port, &mut sink) {
-            Ok(Some(())) | Ok(None) => {}
-            Err(e) => panic!("receive failed: {e}"),
+        if input.is_empty() {
+            break;
         }
-        if receiver.state() == State::FileBegin {
+        let consumed = receiver.feed_incoming(input).unwrap();
+        if consumed == 0 {
+            if !receiver.drain_outgoing().is_empty() {
+                receiver.advance_outgoing(receiver.drain_outgoing().len());
+            }
+        } else {
+            input = &input[consumed..];
+        }
+
+        if let Some(ReceiverEvent::FileStart) = receiver.poll_event() {
+            got_start = true;
             break;
         }
     }
 
-    assert_eq!(receiver.state(), State::FileBegin);
+    assert!(got_start);
     assert_eq!(receiver.file_name(), file_name);
     assert_eq!(receiver.file_size(), file_size);
 }

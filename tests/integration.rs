@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2017-2020 Alexey Arbuzov
-// Copyright (c) 2023-2025 Jarkko Sakkinen
+// Copyright (c) 2023-2026 Jarkko Sakkinen
 
 use nix::fcntl::{self, OFlag};
-use nix::unistd;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Result, Write};
+use std::io::{BufRead, BufReader, Read, Result, Seek, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -227,8 +226,6 @@ impl Write for MockBlockingFile {
 #[test]
 #[cfg(has_lrzsz)]
 fn test_batch_from_sz() {
-    use zmodem2::{State, Transmission};
-
     let test_files = TestFiles::new();
     let dest_dir = tempfile::Builder::new()
         .prefix("zmodem_test_dest_")
@@ -236,49 +233,102 @@ fn test_batch_from_sz() {
         .unwrap();
 
     let (mut sz_process, mut port) = setup_sz(&test_files);
-    let mut state = Transmission::new();
+    let mut receiver = zmodem2::Receiver::new().unwrap();
     let mut open_files: HashMap<Vec<u8>, MockBlockingFile> = HashMap::new();
     let mut sink = std::io::sink();
     let mut current_file_name_bytes: Vec<u8> = Vec::new();
+    let mut wire_buf = [0u8; 4096];
+    let mut input_buf: Vec<u8> = Vec::new();
+    let mut input_offset: usize = 0;
+    let mut session_done = false;
 
-    while state.state() != State::SessionEnd {
-        if state.state() == State::FileBegin
-            && state.file_name() != current_file_name_bytes.as_slice()
-        {
-            let filename_bytes = state.file_name();
-            let filename_str = std::str::from_utf8(filename_bytes).unwrap();
-            let filename = Path::new(filename_str)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap();
-            let file_path = dest_dir.path().join(filename);
-            let file = File::create(file_path).unwrap();
-            open_files.insert(
-                filename_bytes.to_vec(),
-                MockBlockingFile { file, counter: 0 },
-            );
-            current_file_name_bytes = filename_bytes.to_vec();
-        }
+    while !session_done || !receiver.drain_outgoing().is_empty() {
+        let mut progressed = false;
 
-        let mut file_writer: &mut dyn Write = open_files
-            .get_mut(&current_file_name_bytes)
-            .map(|f| f as &mut dyn Write)
-            .unwrap_or(&mut sink);
-
-        match state.receive(&mut port, &mut file_writer) {
-            Ok(Some(())) => continue,
-            Ok(None) => {
-                sleep(Duration::from_millis(10));
+        if !receiver.drain_outgoing().is_empty() {
+            match port.write(receiver.drain_outgoing()) {
+                Ok(0) => {}
+                Ok(n) => {
+                    receiver.advance_outgoing(n);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("wire write failed: {e}"),
             }
-            Err(e) => panic!("receive failed: {e}"),
         }
-    }
 
-    let mut drain = [0u8; 1024];
-    while let Ok(None) = state.receive(&mut port, &mut sink) {
-        let _ = unistd::read(port.r.as_raw_fd(), &mut drain);
-        sleep(Duration::from_millis(10));
+        if !receiver.drain_file().is_empty() {
+            let file_writer: &mut dyn Write = open_files
+                .get_mut(&current_file_name_bytes)
+                .map(|f| f as &mut dyn Write)
+                .unwrap_or(&mut sink);
+
+            match file_writer.write(receiver.drain_file()) {
+                Ok(0) => {}
+                Ok(n) => {
+                    receiver.advance_file(n).unwrap();
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("file write failed: {e}"),
+            }
+        }
+
+        match port.read(&mut wire_buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                input_buf.extend_from_slice(&wire_buf[..n]);
+                progressed = true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("wire read failed: {e}"),
+        }
+
+        if receiver.drain_outgoing().is_empty()
+            && receiver.drain_file().is_empty()
+            && input_offset < input_buf.len()
+        {
+            let consumed = receiver.feed_incoming(&input_buf[input_offset..]).unwrap();
+            if consumed > 0 {
+                input_offset += consumed;
+                progressed = true;
+                if input_offset == input_buf.len() {
+                    input_buf.clear();
+                    input_offset = 0;
+                } else if input_offset > 4096 {
+                    input_buf.drain(..input_offset);
+                    input_offset = 0;
+                }
+            }
+        }
+
+        while let Some(event) = receiver.poll_event() {
+            match event {
+                zmodem2::ReceiverEvent::FileStart => {
+                    let name = receiver.file_name();
+                    if name != current_file_name_bytes.as_slice() {
+                        let filename_str = std::str::from_utf8(name).unwrap();
+                        let filename = Path::new(filename_str)
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap();
+                        let file_path = dest_dir.path().join(filename);
+                        let file = File::create(file_path).unwrap();
+                        open_files.insert(name.to_vec(), MockBlockingFile { file, counter: 0 });
+                        current_file_name_bytes = name.to_vec();
+                    }
+                }
+                zmodem2::ReceiverEvent::FileComplete => {}
+                zmodem2::ReceiverEvent::SessionComplete => {
+                    session_done = true;
+                }
+            }
+        }
+
+        if !progressed {
+            sleep(Duration::from_millis(5));
+        }
     }
 
     sz_process.wait().unwrap();
@@ -297,8 +347,6 @@ fn test_batch_from_sz() {
 #[test]
 #[cfg(has_lrzsz)]
 fn test_batch_to_rz() {
-    use zmodem2::{State, Transmission};
-
     let test_files = TestFiles::new();
     let dest_dir = tempfile::Builder::new()
         .prefix("zmodem_test_dest_")
@@ -319,41 +367,90 @@ fn test_batch_to_rz() {
     let first_path = file_iter.next().expect("No test files found");
     let first_filename = first_path.file_name().unwrap().to_str().unwrap();
     let first_size = first_path.metadata().unwrap().len() as u32;
-    let mut state = Transmission::set_first_file(first_filename, first_size).unwrap();
+    let mut sender = zmodem2::Sender::new().unwrap();
+    sender
+        .start_file(first_filename.as_bytes(), first_size)
+        .unwrap();
+    let mut current_filename = first_filename.to_string();
+    let mut wire_buf = [0u8; 4096];
+    let mut input_buf: Vec<u8> = Vec::new();
+    let mut input_offset: usize = 0;
+    let mut file_buf = [0u8; 1024];
+    let mut session_done = false;
 
-    'send_loop: while state.state() != State::SessionEnd {
-        if state.state() == State::FileEnd {
-            if let Some(next_path) = file_iter.next() {
-                let next_filename = next_path.file_name().unwrap().to_str().unwrap();
-                let next_size = next_path.metadata().unwrap().len() as u32;
-                state.set_next_file(next_filename, next_size).unwrap();
-            } else {
-                break 'send_loop;
+    while !session_done || !sender.drain_outgoing().is_empty() {
+        let mut progressed = false;
+
+        if !sender.drain_outgoing().is_empty() {
+            match port.write(sender.drain_outgoing()) {
+                Ok(0) => {}
+                Ok(n) => {
+                    sender.advance_outgoing(n);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("wire write failed: {e}"),
             }
         }
 
-        let current_filename_bytes = state.file_name();
-        let current_filename_str = std::str::from_utf8(current_filename_bytes).unwrap();
-        let file = open_files
-            .get_mut(current_filename_str)
-            .expect("File not found in map");
-
-        match state.send(&mut port, file) {
-            Ok(Some(())) => continue,
-            Ok(None) => {
-                sleep(Duration::from_millis(10));
-            }
-            Err(e) => panic!("send failed: {e}"),
+        if let Some(request) = sender.poll_file() {
+            let file = open_files
+                .get_mut(&current_filename)
+                .expect("File not found in map");
+            file.seek(std::io::SeekFrom::Start(u64::from(request.offset)))
+                .unwrap();
+            let n = file.read(&mut file_buf[..request.len]).unwrap();
+            sender.feed_file(&file_buf[..n]).unwrap();
+            progressed = true;
         }
-    }
 
-    while state.state() != State::SessionEnd {
-        match state.finish(&mut port) {
-            Ok(Some(())) => continue,
-            Ok(None) => {
-                sleep(Duration::from_millis(50));
+        match port.read(&mut wire_buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                input_buf.extend_from_slice(&wire_buf[..n]);
+                progressed = true;
             }
-            Err(e) => panic!("finish failed: {e}"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("wire read failed: {e}"),
+        }
+
+        if sender.drain_outgoing().is_empty() && input_offset < input_buf.len() {
+            let consumed = sender.feed_incoming(&input_buf[input_offset..]).unwrap();
+            if consumed > 0 {
+                input_offset += consumed;
+                progressed = true;
+                if input_offset == input_buf.len() {
+                    input_buf.clear();
+                    input_offset = 0;
+                } else if input_offset > 4096 {
+                    input_buf.drain(..input_offset);
+                    input_offset = 0;
+                }
+            }
+        }
+
+        if let Some(event) = sender.poll_event() {
+            match event {
+                zmodem2::SenderEvent::FileComplete => {
+                    if let Some(next_path) = file_iter.next() {
+                        let next_filename = next_path.file_name().unwrap().to_str().unwrap();
+                        let next_size = next_path.metadata().unwrap().len() as u32;
+                        sender
+                            .start_file(next_filename.as_bytes(), next_size)
+                            .unwrap();
+                        current_filename = next_filename.to_string();
+                    } else {
+                        sender.finish_session().unwrap();
+                    }
+                }
+                zmodem2::SenderEvent::SessionComplete => {
+                    session_done = true;
+                }
+            }
+        }
+
+        if !progressed {
+            sleep(Duration::from_millis(5));
         }
     }
 
