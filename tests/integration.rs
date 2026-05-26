@@ -325,6 +325,7 @@ fn test_batch_from_sz() {
                 zmodem2::ReceiverEvent::SessionComplete => {
                     session_done = true;
                 }
+                zmodem2::ReceiverEvent::Aborted => panic!("receiver aborted"),
             }
         }
 
@@ -448,6 +449,7 @@ fn test_batch_to_rz() {
                 zmodem2::SenderEvent::SessionComplete => {
                     session_done = true;
                 }
+                zmodem2::SenderEvent::Aborted => panic!("sender aborted"),
             }
         }
 

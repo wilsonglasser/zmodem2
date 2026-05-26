@@ -3,7 +3,10 @@
 // Copyright (c) 2023-2026 Jarkko Sakkinen
 
 use rstest::rstest;
-use zmodem2::{Encoding, Frame, Header, Receiver, ReceiverEvent, Sender, XON, ZDLE, ZPAD};
+use zmodem2::{
+    Effect, Encoding, Error, FileInfo, Frame, Header, Input, Progress, Receiver, ReceiverEvent,
+    Sender, SenderEvent, SessionEvent, SubpacketType, XON, ZDLE, ZPAD,
+};
 
 #[rstest]
 #[case(Encoding::ZBIN, Frame::ZRQINIT, &[0; 4], &[ZPAD, ZDLE, Encoding::ZBIN as u8, 0, 0, 0, 0, 0, 0, 0])]
@@ -97,4 +100,232 @@ fn test_receive_zfile_with_non_utf8_name() {
     assert!(got_start);
     assert_eq!(receiver.file_name(), file_name);
     assert_eq!(receiver.file_size(), file_size);
+}
+
+fn header_bytes(header: Header) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    header.write(&mut bytes).unwrap();
+    bytes
+}
+
+fn test_crc32_iso_hdlc(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+fn encode_zdle(byte: u8) -> u8 {
+    match byte {
+        0x0d => 0x4d,
+        0x10 => 0x50,
+        0x11 => 0x51,
+        0x13 => 0x53,
+        0x18 => 0x58,
+        0x7f => 0x6c,
+        0x8d => 0xcd,
+        0x90 => 0xd0,
+        0x91 => 0xd1,
+        0x93 => 0xd3,
+        0xff => 0x6d,
+        _ => byte,
+    }
+}
+
+fn escaped_zbin32_subpacket(kind: SubpacketType, data: &[u8]) -> Vec<u8> {
+    fn push_escaped(out: &mut Vec<u8>, byte: u8) {
+        let escaped = encode_zdle(byte);
+        if escaped != byte {
+            out.push(ZDLE);
+        }
+        out.push(escaped);
+    }
+
+    let mut out = Vec::new();
+    for &byte in data {
+        push_escaped(&mut out, byte);
+    }
+    out.push(ZDLE);
+    out.push(kind as u8);
+
+    let mut crc_input = Vec::from(data);
+    crc_input.push(kind as u8);
+    for byte in test_crc32_iso_hdlc(&crc_input).to_le_bytes() {
+        push_escaped(&mut out, byte);
+    }
+    out
+}
+
+fn feed_receiver_zfile(receiver: &mut Receiver) {
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
+
+    let mut bytes = header_bytes(Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4]));
+    bytes.extend(escaped_zbin32_subpacket(
+        SubpacketType::ZCRCW,
+        b"file.bin\x00123\x00",
+    ));
+
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let consumed = receiver.feed_incoming(&bytes[offset..]).unwrap();
+        assert!(consumed > 0);
+        offset += consumed;
+        receiver.advance_outgoing(receiver.drain_outgoing().len());
+    }
+    assert_eq!(receiver.poll_event(), Some(ReceiverEvent::FileStart));
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
+}
+
+#[test]
+fn test_sender_resumes_from_zrpos() {
+    let mut sender = Sender::new().unwrap();
+    sender.advance_outgoing(sender.drain_outgoing().len());
+    sender.start_file(b"resume.bin", 16).unwrap();
+
+    let zrinit = header_bytes(Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0; 4]));
+    assert!(sender.feed_incoming(&zrinit).unwrap() > 0);
+    sender.advance_outgoing(sender.drain_outgoing().len());
+
+    let zrpos = header_bytes(Header::new(
+        Encoding::ZHEX,
+        Frame::ZRPOS,
+        &5u32.to_le_bytes(),
+    ));
+    assert!(sender.feed_incoming(&zrpos).unwrap() > 0);
+
+    assert_eq!(sender.poll_file().unwrap().offset, 5);
+}
+
+#[test]
+fn test_sender_skips_file_on_zskip() {
+    let mut sender = Sender::new().unwrap();
+    sender.advance_outgoing(sender.drain_outgoing().len());
+    sender.start_file(b"skip.bin", 16).unwrap();
+
+    let zrinit = header_bytes(Header::new(Encoding::ZHEX, Frame::ZRINIT, &[0; 4]));
+    sender.feed_incoming(&zrinit).unwrap();
+    sender.advance_outgoing(sender.drain_outgoing().len());
+
+    let zskip = header_bytes(Header::new(Encoding::ZHEX, Frame::ZSKIP, &[0; 4]));
+    sender.feed_incoming(&zskip).unwrap();
+
+    assert_eq!(sender.poll_event(), Some(SenderEvent::FileComplete));
+}
+
+#[test]
+fn test_abort_events() {
+    let zabort = header_bytes(Header::new(Encoding::ZHEX, Frame::ZABORT, &[0; 4]));
+
+    let mut sender = Sender::new().unwrap();
+    sender.advance_outgoing(sender.drain_outgoing().len());
+    assert!(sender.feed_incoming(&zabort).unwrap() > 0);
+    assert_eq!(sender.poll_event(), Some(SenderEvent::Aborted));
+
+    let mut receiver = Receiver::new().unwrap();
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
+    assert!(receiver.feed_incoming(&zabort).unwrap() > 0);
+    assert_eq!(receiver.poll_event(), Some(ReceiverEvent::Aborted));
+}
+
+#[test]
+fn test_receiver_timeout_requeues_zrinit() {
+    let mut receiver = Receiver::new().unwrap();
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
+
+    match receiver.step(Input::Timeout).unwrap() {
+        Progress::Effect(Effect::WriteWire(bytes)) => assert!(!bytes.is_empty()),
+        progress => panic!("unexpected progress: {progress:?}"),
+    }
+}
+
+#[test]
+fn test_step_start_file_rejects_unknown_size() {
+    let mut sender = Sender::new().unwrap();
+    let info = FileInfo::new(b"unknown.bin", None);
+
+    assert_eq!(
+        sender.step(Input::StartFile(info)),
+        Err(Error::UnsupportedFeature)
+    );
+}
+
+#[test]
+fn test_malformed_subpacket_crc() {
+    let mut receiver = Receiver::new().unwrap();
+    feed_receiver_zfile(&mut receiver);
+
+    let mut bytes = header_bytes(Header::new(Encoding::ZBIN32, Frame::ZDATA, &[0; 4]));
+    let mut subpacket = escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"bad");
+    let last = subpacket.last_mut().unwrap();
+    *last ^= 0x01;
+    bytes.extend(subpacket);
+
+    let mut offset = 0;
+    let err = loop {
+        match receiver.feed_incoming(&bytes[offset..]) {
+            Ok(consumed) => {
+                assert!(consumed > 0);
+                offset += consumed;
+            }
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(err, Error::UnexpectedCrc32);
+}
+
+#[test]
+fn test_receiver_zcrcq_and_zcrce() {
+    let mut receiver = Receiver::new().unwrap();
+    feed_receiver_zfile(&mut receiver);
+
+    let mut first = header_bytes(Header::new(Encoding::ZBIN32, Frame::ZDATA, &[0; 4]));
+    first.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCQ, b"abc"));
+    let mut offset = 0;
+    while offset < first.len() && receiver.drain_file().is_empty() {
+        let consumed = receiver.feed_incoming(&first[offset..]).unwrap();
+        assert!(consumed > 0);
+        offset += consumed;
+    }
+    assert_eq!(receiver.drain_file(), b"abc");
+    receiver.advance_file(3).unwrap();
+    assert!(!receiver.drain_outgoing().is_empty());
+    receiver.advance_outgoing(receiver.drain_outgoing().len());
+
+    let second = escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"def");
+    let mut offset = 0;
+    while offset < second.len() && receiver.drain_file().is_empty() {
+        let consumed = receiver.feed_incoming(&second[offset..]).unwrap();
+        assert!(consumed > 0);
+        offset += consumed;
+    }
+    assert_eq!(receiver.drain_file(), b"def");
+    receiver.advance_file(3).unwrap();
+    assert!(receiver.drain_outgoing().is_empty());
+
+    let zeof = header_bytes(Header::new(
+        Encoding::ZBIN32,
+        Frame::ZEOF,
+        &6u32.to_le_bytes(),
+    ));
+    assert!(receiver.feed_incoming(&zeof).unwrap() > 0);
+    assert_eq!(receiver.poll_event(), Some(ReceiverEvent::FileComplete));
+}
+
+#[test]
+fn test_step_abort_event() {
+    let mut sender = Sender::new().unwrap();
+    sender.advance_outgoing(sender.drain_outgoing().len());
+
+    match sender.step(Input::Abort).unwrap() {
+        Progress::Effect(Effect::Event(SessionEvent::Aborted)) => {}
+        progress => panic!("unexpected progress: {progress:?}"),
+    }
 }

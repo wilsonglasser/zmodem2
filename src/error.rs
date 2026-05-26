@@ -21,6 +21,10 @@ pub enum Error {
     MalformedPacket(u8),
     #[cfg_attr(feature = "std", error("not connected"))]
     NotConnected,
+    #[cfg_attr(feature = "std", error("invalid state"))]
+    InvalidState,
+    #[cfg_attr(feature = "std", error("backpressure"))]
+    Backpressure,
     #[cfg_attr(feature = "std", error("read: {0}"))]
     Read(String),
     #[cfg_attr(feature = "std", error("out of memory"))]
@@ -31,8 +35,8 @@ pub enum Error {
     UnexpectedCrc32,
     #[cfg_attr(feature = "std", error("unexpected EOF"))]
     UnexpectedEof,
-    #[cfg_attr(feature = "std", error("unsupported operation"))]
-    Unsupported,
+    #[cfg_attr(feature = "std", error("unsupported feature"))]
+    UnsupportedFeature,
     #[cfg_attr(feature = "std", error("write: {0}"))]
     Write(String),
 }

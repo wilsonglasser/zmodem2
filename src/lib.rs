@@ -21,18 +21,29 @@
 #![allow(clippy::result_large_err)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod api;
 mod buffer;
 mod crc;
+#[cfg(feature = "embedded-io")]
+mod embedded_io;
 mod error;
+mod file;
 mod header;
 mod io;
+mod receiver;
+mod sender;
+mod session;
 #[cfg(feature = "std")]
 mod std;
 mod string;
 mod transmission;
+mod wire;
 mod zdle;
 
+pub use api::*;
 pub use buffer::*;
+#[cfg(feature = "embedded-io")]
+pub use embedded_io::*;
 pub use error::*;
 pub use header::*;
 pub use io::*;

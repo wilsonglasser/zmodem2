@@ -13,9 +13,11 @@ build = "build.rs"
 [features]
 default = ["std"]
 std = []
+embedded-io = ["dep:embedded-io"]
 
 [dependencies]
 bitflags = "2.4"
+embedded-io = { version = "0.6", default-features = false, optional = true }
 hex = "0.4.3"
 thiserror = "1.0"
 
