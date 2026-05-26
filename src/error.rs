@@ -2,37 +2,37 @@
 // Copyright (c) 2023-2025 Jarkko Sakkinen
 
 use crate::String;
-use thiserror::Error;
 
 /// Top-level error type.
-#[derive(Error, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
+#[cfg_attr(feature = "std", derive(thiserror::Error))]
 pub enum Error {
-    #[error("malformed encoding type: {0:#02x}")]
+    #[cfg_attr(feature = "std", error("malformed encoding type: {0:#02x}"))]
     MalformedEncoding(u8),
-    #[error("malformed file size")]
+    #[cfg_attr(feature = "std", error("malformed file size"))]
     MalformedFileSize,
-    #[error("malformed filename")]
+    #[cfg_attr(feature = "std", error("malformed filename"))]
     MalformedFileName,
-    #[error("malformed frame type: {0:#02x}")]
+    #[cfg_attr(feature = "std", error("malformed frame type: {0:#02x}"))]
     MalformedFrame(u8),
-    #[error("malformed header")]
+    #[cfg_attr(feature = "std", error("malformed header"))]
     MalformedHeader,
-    #[error("malformed packet type: {0:#02x}")]
+    #[cfg_attr(feature = "std", error("malformed packet type: {0:#02x}"))]
     MalformedPacket(u8),
-    #[error("not connected")]
+    #[cfg_attr(feature = "std", error("not connected"))]
     NotConnected,
-    #[error("read: {0}")]
+    #[cfg_attr(feature = "std", error("read: {0}"))]
     Read(String),
-    #[error("out of memory")]
+    #[cfg_attr(feature = "std", error("out of memory"))]
     OutOfMemory,
-    #[error("unexpected CRC-16")]
+    #[cfg_attr(feature = "std", error("unexpected CRC-16"))]
     UnexpectedCrc16,
-    #[error("unexpected CRC-32")]
+    #[cfg_attr(feature = "std", error("unexpected CRC-32"))]
     UnexpectedCrc32,
-    #[error("unexpected EOF")]
+    #[cfg_attr(feature = "std", error("unexpected EOF"))]
     UnexpectedEof,
-    #[error("unsupported operation")]
+    #[cfg_attr(feature = "std", error("unsupported operation"))]
     Unsupported,
-    #[error("write: {0}")]
+    #[cfg_attr(feature = "std", error("write: {0}"))]
     Write(String),
 }

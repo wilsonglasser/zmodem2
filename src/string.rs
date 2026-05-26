@@ -4,6 +4,7 @@
 use super::{Buffer, CapacityError};
 use core::{
     cmp::min,
+    fmt,
     ops::{Deref, DerefMut},
 };
 
@@ -96,5 +97,20 @@ where
 {
     fn eq(&self, other: &T) -> bool {
         self.as_ref() == other.as_ref()
+    }
+}
+
+impl fmt::Debug for String {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match core::str::from_utf8(self) {
+            Ok(s) => f.write_str(s),
+            Err(_) => f.debug_list().entries(self.iter()).finish(),
+        }
+    }
+}
+
+impl fmt::Display for String {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(core::str::from_utf8(self).unwrap_or(""))
     }
 }

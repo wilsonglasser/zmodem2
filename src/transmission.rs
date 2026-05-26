@@ -1036,56 +1036,55 @@ impl Receiver {
 
     fn handle_header(&mut self, header: Header) -> Result<(), Error> {
         match header.frame() {
-            Frame::ZRQINIT => {
-                if self.state == RecvState::SessionBegin {
-                    self.queue_zrinit()?;
-                }
+            Frame::ZRQINIT | Frame::ZDATA if self.state == RecvState::SessionBegin => {
+                self.queue_zrinit()?;
             }
-            Frame::ZFILE => {
-                if self.state == RecvState::SessionBegin || self.state == RecvState::FileBegin {
-                    self.data_encoding = header.encoding();
-                    self.state = RecvState::FileReadingMetadata;
-                    self.subpacket_state = SubpacketState::Reading;
-                    self.subpacket_escape_pending = false;
-                    self.crc.reset();
-                    self.buf.clear();
-                    self.buf_write_offset = 0;
-                }
+            Frame::ZFILE
+                if matches!(self.state, RecvState::SessionBegin | RecvState::FileBegin) =>
+            {
+                self.data_encoding = header.encoding();
+                self.state = RecvState::FileReadingMetadata;
+                self.subpacket_state = SubpacketState::Reading;
+                self.subpacket_escape_pending = false;
+                self.crc.reset();
+                self.buf.clear();
+                self.buf_write_offset = 0;
             }
-            Frame::ZDATA => {
-                if self.state == RecvState::SessionBegin {
-                    self.queue_zrinit()?;
-                } else if self.state == RecvState::FileBegin
-                    || self.state == RecvState::FileWaitingSubpacket
-                {
-                    if header.count() != self.count {
-                        self.queue_zrpos(self.count)?;
-                        return Ok(());
-                    }
-                    self.data_encoding = header.encoding();
-                    self.state = RecvState::FileReadingSubpacket;
-                    self.subpacket_state = SubpacketState::Reading;
-                    self.subpacket_escape_pending = false;
-                    self.crc.reset();
-                    self.buf.clear();
-                    self.buf_write_offset = 0;
+            Frame::ZDATA
+                if matches!(
+                    self.state,
+                    RecvState::FileBegin | RecvState::FileWaitingSubpacket
+                ) =>
+            {
+                if header.count() != self.count {
+                    self.queue_zrpos(self.count)?;
+                    return Ok(());
                 }
+                self.data_encoding = header.encoding();
+                self.state = RecvState::FileReadingSubpacket;
+                self.subpacket_state = SubpacketState::Reading;
+                self.subpacket_escape_pending = false;
+                self.crc.reset();
+                self.buf.clear();
+                self.buf_write_offset = 0;
             }
-            Frame::ZEOF => {
-                if self.state == RecvState::FileWaitingSubpacket && header.count() == self.count {
-                    self.queue_zrinit()?;
-                    self.state = RecvState::FileBegin;
-                    self.push_event(ReceiverEvent::FileComplete)?;
-                }
-            }
-            Frame::ZFIN => {
+            Frame::ZEOF
                 if self.state == RecvState::FileWaitingSubpacket
-                    || self.state == RecvState::FileBegin
-                {
-                    self.queue_zfin()?;
-                    self.state = RecvState::SessionEnd;
-                    self.push_event(ReceiverEvent::SessionComplete)?;
-                }
+                    && header.count() == self.count =>
+            {
+                self.queue_zrinit()?;
+                self.state = RecvState::FileBegin;
+                self.push_event(ReceiverEvent::FileComplete)?;
+            }
+            Frame::ZFIN
+                if matches!(
+                    self.state,
+                    RecvState::FileWaitingSubpacket | RecvState::FileBegin
+                ) =>
+            {
+                self.queue_zfin()?;
+                self.state = RecvState::SessionEnd;
+                self.push_event(ReceiverEvent::SessionComplete)?;
             }
             _ => {}
         }

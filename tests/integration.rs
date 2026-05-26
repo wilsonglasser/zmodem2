@@ -2,6 +2,8 @@
 // Copyright (c) 2017-2020 Alexey Arbuzov
 // Copyright (c) 2023-2026 Jarkko Sakkinen
 
+#![cfg(has_lrzsz)]
+
 use nix::fcntl::{self, OFlag};
 use std::cmp::{max, min};
 use std::collections::HashMap;
