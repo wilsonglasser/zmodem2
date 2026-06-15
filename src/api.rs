@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Public protocol primitives for the 0.6 step/effect API.
-
-use crate::Encoding;
+//! Public protocol primitives for the poll/submit API.
 
 /// Byte offset in a ZMODEM file transfer.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -55,96 +53,34 @@ impl<'a> FileInfo<'a> {
     }
 }
 
-/// Header and subpacket frame-check encoding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WireEncoding {
-    /// Binary header or subpacket with a 16-bit CRC.
-    Binary16,
-    /// Hex header with a 16-bit CRC.
-    Hex,
-    /// Binary header or subpacket with a 32-bit CRC.
-    Binary32,
-}
-
-impl From<Encoding> for WireEncoding {
-    fn from(encoding: Encoding) -> Self {
-        match encoding {
-            Encoding::ZBIN => Self::Binary16,
-            Encoding::ZHEX => Self::Hex,
-            Encoding::ZBIN32 => Self::Binary32,
-        }
-    }
-}
-
-impl From<WireEncoding> for Encoding {
-    fn from(encoding: WireEncoding) -> Self {
-        match encoding {
-            WireEncoding::Binary16 => Self::ZBIN,
-            WireEncoding::Hex => Self::ZHEX,
-            WireEncoding::Binary32 => Self::ZBIN32,
-        }
-    }
-}
-
-/// Represents input submitted to the protocol state machine.
+/// The next action the caller must perform, returned by
+/// [`Sender::poll`](crate::Sender::poll) and
+/// [`Receiver::poll`](crate::Receiver::poll).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Input<'a> {
-    /// Incoming bytes from the transport.
-    Wire(&'a [u8]),
-    /// File bytes provided by the caller for a prior read request.
-    FileData(&'a [u8]),
-    /// A file offered by the caller for transmission.
-    ///
-    /// Senders currently require [`FileInfo::size`] to be known.
-    StartFile(FileInfo<'a>),
-    /// Number of wire bytes written by the caller.
-    OutgoingAdvanced(usize),
-    /// Number of received file bytes stored by the caller.
-    FileAdvanced(usize),
-    /// Protocol response timeout expired.
-    Timeout,
-    /// Finish the current session after queued work completes.
-    Finish,
-    /// Abort the current session.
-    Abort,
-}
-
-/// Represents observable action requested by the protocol state machine.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum Effect<'a> {
-    /// Write these bytes to the transport.
+pub enum Action<'a> {
+    /// Write these bytes to the transport, then report progress with
+    /// `wire_written`.
     WriteWire(&'a [u8]),
-    /// Read at most `max_len` bytes from the file at `offset`.
+    /// Read at most `max_len` file bytes at `offset` and provide them with
+    /// [`Sender::submit_file`](crate::Sender::submit_file). Senders only.
     ReadFile { offset: Position, max_len: usize },
-    /// Store received file bytes.
+    /// Persist these received bytes, then report progress with
+    /// [`Receiver::file_written`](crate::Receiver::file_written). Receivers
+    /// only.
     WriteFile(&'a [u8]),
-    /// Deliver a protocol event.
-    Event(SessionEvent<'a>),
-    /// No action is currently pending.
+    /// A protocol event occurred.
+    Event(Event<'a>),
+    /// No work is pending. Submit more wire input with `submit_wire`, or wait
+    /// for a `timeout`.
     Idle,
 }
 
-/// Result of one state-machine step.
+/// Protocol-level event surfaced through [`Action::Event`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Progress<'a> {
-    /// The input made progress and consumed this many bytes or units.
-    Consumed(usize),
-    /// The caller must perform an effect before the state machine can advance.
-    Effect(Effect<'a>),
-    /// The state machine has no immediate work.
-    Idle,
-}
-
-/// Protocol-level event produced by the state machine.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SessionEvent<'a> {
-    /// The session handshake completed.
-    SessionStarted,
-    /// A new incoming or outgoing file started.
+pub enum Event<'a> {
+    /// A new incoming file started, with its advertised metadata.
     FileStarted(FileInfo<'a>),
     /// The current file completed.
     FileCompleted,

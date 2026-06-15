@@ -2,19 +2,24 @@
 // Copyright (c) 2017-2020 Alexey Arbuzov
 // Copyright (c) 2023-2026 Jarkko Sakkinen
 
-//! ZMODEM file transfer protocol library. `zmodem2::Sender` and
-//! `zmodem2::Receiver` provide stream alike state machines for sending and
-//! receiving files with the ZMODEM protocol.
+//! ZMODEM file transfer protocol library. [`Sender`] and [`Receiver`] are
+//! caller-driven state machines for sending and receiving files with the
+//! ZMODEM protocol. The crate is `no_std` compatible and heapless.
 //!
-//! The usage can be described in the high-level with the following flow:
-//! 1. Create `zmodem2::Sender` or `zmodem2::Receiver`.
-//! 2. Drain `drain_outgoing()` returned bytes into the wire and call
-//!    `advance_outgoing()` after writing. Then, feed incoming bytes with
-//!    `feed_incoming()`.
-//! 3. In the sender, complete `poll_file()` with `feed_file()` if required
-//!    and handle events via `poll_event()`.
-//! 4. In the receiver, write `drain_file()` returned bytes into storage, and
-//!    call `advance_file()` after writing. Handle events via `poll_event()`.
+//! The caller owns all I/O. The loop is the same for both roles:
+//! 1. Create a [`Sender`] or [`Receiver`].
+//! 2. Call `poll()` to get the next [`Action`]:
+//!    - [`Action::WriteWire`] — write the bytes to the transport, then call
+//!      `wire_written(n)`.
+//!    - [`Action::ReadFile`] (sender) — read the requested file bytes and
+//!      provide them with [`Sender::submit_file`].
+//!    - [`Action::WriteFile`] (receiver) — persist the bytes, then call
+//!      [`Receiver::file_written`].
+//!    - [`Action::Event`] — handle a protocol [`Event`].
+//!    - [`Action::Idle`] — feed incoming transport bytes with `submit_wire()`,
+//!      or call `timeout()` if none arrive.
+//! 3. The sender offers files with [`Sender::start_file`] and ends the session
+//!    with [`Sender::finish`].
 
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
@@ -24,8 +29,6 @@
 mod api;
 mod buffer;
 mod crc;
-#[cfg(feature = "embedded-io")]
-mod embedded_io;
 mod error;
 mod file;
 mod header;
@@ -33,23 +36,17 @@ mod io;
 mod receiver;
 mod sender;
 mod session;
-#[cfg(feature = "std")]
-mod std;
 mod string;
+#[cfg(test)]
+mod tests;
 mod transmission;
 mod wire;
 mod zdle;
 
 pub use api::*;
-pub use buffer::*;
-#[cfg(feature = "embedded-io")]
-pub use embedded_io::*;
 pub use error::*;
-pub use header::*;
-pub use io::*;
-pub use string::*;
 pub use transmission::*;
 
-pub const ZPAD: u8 = b'*';
-pub const ZDLE: u8 = 0x18;
-pub const XON: u8 = 0x11;
+pub(crate) const ZPAD: u8 = b'*';
+pub(crate) const ZDLE: u8 = 0x18;
+pub(crate) const XON: u8 = 0x11;

@@ -4,7 +4,7 @@
 
 //! ZMODEM receiver state machine.
 
-use crate::api::{Effect, Input, Progress, SessionEvent};
+use crate::api::{Action, Event, FileInfo, Position};
 use crate::buffer::Buffer;
 use crate::error::Error;
 use crate::file::parse_file_size;
@@ -46,7 +46,7 @@ impl Receiver {
     ///
     /// # Errors
     ///
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`OutOfMemory`](crate::Error::OutOfMemory) when the outgoing buffer cannot hold the handshake
     pub fn new() -> Result<Self, Error> {
         let mut receiver = Self {
             state: ReceiverPhase::SessionBegin,
@@ -70,17 +70,15 @@ impl Receiver {
         Ok(receiver)
     }
 
-    /// Feeds incoming wire data into the state machine.
+    /// Submits incoming wire data into the state machine.
     ///
     /// Returns the number of bytes consumed.
     ///
     /// # Errors
     ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`UnexpectedCrc16`](crate::Error::UnexpectedCrc16) or
     ///   [`UnexpectedCrc32`](crate::Error::UnexpectedCrc32) when corrupted data has been detected
-    pub fn feed_incoming(&mut self, input: &[u8]) -> Result<usize, Error> {
+    pub fn submit_wire(&mut self, input: &[u8]) -> Result<usize, Error> {
         let mut reader = SliceReader::new(input);
 
         loop {
@@ -136,13 +134,13 @@ impl Receiver {
     }
 
     /// Returns pending outgoing bytes.
-    #[must_use]
-    pub fn drain_outgoing(&self) -> &[u8] {
+    fn drain_outgoing(&self) -> &[u8] {
         &self.outgoing[self.outgoing_offset..]
     }
 
-    /// Advances the outgoing cursor by `n` bytes.
-    pub fn advance_outgoing(&mut self, n: usize) {
+    /// Reports that `n` outgoing bytes from the last [`Action::WriteWire`] were
+    /// written to the transport.
+    pub fn wire_written(&mut self, n: usize) {
         let remaining = self.outgoing.len().saturating_sub(self.outgoing_offset);
         let n = min(n, remaining);
         self.outgoing_offset += n;
@@ -153,20 +151,20 @@ impl Receiver {
     }
 
     /// Returns pending file data bytes.
-    #[must_use]
-    pub fn drain_file(&self) -> &[u8] {
+    fn drain_file(&self) -> &[u8] {
         match self.subpacket_state {
             SubpacketPhase::Writing(_) => &self.buf[self.buf_write_offset..],
             _ => &[],
         }
     }
 
-    /// Advances the file output cursor by `n` bytes.
+    /// Reports that `n` file bytes from the last [`Action::WriteFile`] were
+    /// persisted to storage.
     ///
     /// # Errors
     ///
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    pub fn advance_file(&mut self, n: usize) -> Result<(), Error> {
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still pending
+    pub fn file_written(&mut self, n: usize) -> Result<(), Error> {
         let SubpacketPhase::Writing(packet) = self.subpacket_state else {
             return Ok(());
         };
@@ -185,86 +183,62 @@ impl Receiver {
         self.finish_subpacket(packet)
     }
 
-    /// Returns the next pending receiver event.
-    pub fn poll_event(&mut self) -> Option<ReceiverEvent> {
-        self.pop_event()
-    }
-
-    /// Advances the receiver with one 0.6 step/effect API input.
+    /// Signals that the protocol response timeout expired.
+    ///
+    /// While waiting for a session or file to begin, this re-queues the
+    /// `ZRINIT` handshake.
     ///
     /// # Errors
     ///
-    /// Returns protocol, state, and I/O errors from the underlying receiver.
-    pub fn step<'a>(&'a mut self, input: Input<'a>) -> Result<Progress<'a>, Error> {
-        match input {
-            Input::Wire(bytes) => {
-                let consumed = self.feed_incoming(bytes)?;
-                if consumed == 0 {
-                    Ok(self.next_progress())
-                } else {
-                    Ok(Progress::Consumed(consumed))
-                }
-            }
-            Input::OutgoingAdvanced(count) => {
-                self.advance_outgoing(count);
-                Ok(self.next_progress())
-            }
-            Input::FileAdvanced(count) => {
-                self.advance_file(count)?;
-                Ok(self.next_progress())
-            }
-            Input::Timeout
-                if matches!(
-                    self.state,
-                    ReceiverPhase::SessionBegin | ReceiverPhase::FileBegin
-                ) && !self.outgoing() =>
-            {
-                self.queue_zrinit()?;
-                Ok(self.next_progress())
-            }
-            Input::Abort => {
-                self.state = ReceiverPhase::SessionEnd;
-                self.push_event(ReceiverEvent::Aborted)?;
-                Ok(self.next_progress())
-            }
-            Input::StartFile(_) | Input::FileData(_) | Input::Timeout | Input::Finish => {
-                Err(Error::InvalidState)
-            }
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still pending
+    pub fn timeout(&mut self) -> Result<(), Error> {
+        if matches!(
+            self.state,
+            ReceiverPhase::SessionBegin | ReceiverPhase::FileBegin
+        ) && !self.outgoing()
+        {
+            self.queue_zrinit()?;
         }
+        Ok(())
     }
 
-    fn next_progress(&mut self) -> Progress<'_> {
-        if let Some(event) = self.poll_event() {
-            return Progress::Effect(Effect::Event(match event {
-                ReceiverEvent::FileStart => SessionEvent::FileStarted(crate::FileInfo::new(
-                    self.file_name(),
-                    Some(crate::Position::new(self.file_size())),
+    /// Aborts the current session.
+    ///
+    /// # Errors
+    ///
+    /// * [`OutOfMemory`](crate::Error::OutOfMemory) when the event queue is full
+    pub fn abort(&mut self) -> Result<(), Error> {
+        self.state = ReceiverPhase::SessionEnd;
+        self.push_event(ReceiverEvent::Aborted)
+    }
+
+    /// Returns the next action the caller must perform.
+    ///
+    /// Pending events take priority, followed by outgoing wire bytes, then
+    /// received file bytes, and finally [`Action::Idle`] when there is no
+    /// immediate work.
+    pub fn poll(&mut self) -> Action<'_> {
+        if let Some(event) = self.pop_event() {
+            return Action::Event(match event {
+                ReceiverEvent::FileStart => Event::FileStarted(FileInfo::new(
+                    &self.file_name,
+                    Some(Position::new(self.file_size)),
                 )),
-                ReceiverEvent::FileComplete => SessionEvent::FileCompleted,
-                ReceiverEvent::SessionComplete => SessionEvent::SessionCompleted,
-                ReceiverEvent::Aborted => SessionEvent::Aborted,
-            }));
+                ReceiverEvent::FileComplete => Event::FileCompleted,
+                ReceiverEvent::SessionComplete => Event::SessionCompleted,
+                ReceiverEvent::Aborted => Event::Aborted,
+            });
         }
 
         if self.outgoing() {
-            return Progress::Effect(Effect::WriteWire(self.drain_outgoing()));
+            return Action::WriteWire(self.drain_outgoing());
         }
 
         if !self.drain_file().is_empty() {
-            return Progress::Effect(Effect::WriteFile(self.drain_file()));
+            return Action::WriteFile(self.drain_file());
         }
 
-        Progress::Idle
-    }
-
-    #[must_use]
-    pub fn file_name(&self) -> &[u8] {
-        &self.file_name
-    }
-
-    #[must_use]
-    pub fn file_size(&self) -> u32 {
-        self.file_size
+        Action::Idle
     }
 
     fn outgoing(&self) -> bool {

@@ -6,5 +6,3 @@
 
 pub use crate::receiver::Receiver;
 pub use crate::sender::Sender;
-pub use crate::session::{FileRequest, ReceiverEvent, SenderEvent};
-pub use crate::wire::SubpacketType;

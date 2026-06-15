@@ -13,7 +13,6 @@ use crate::header::{
 use crate::io::{Read, Write};
 use crate::zdle;
 use crate::{ZDLE, ZPAD};
-use core::cmp::min;
 
 /// Size of the unescaped subpacket payload. The size is picked from the
 /// original ZMODEM specification.
@@ -192,16 +191,6 @@ impl<'a> SliceReader<'a> {
 }
 
 impl Read for SliceReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<Option<u32>, Error> {
-        if self.pos >= self.buf.len() {
-            return Ok(None);
-        }
-        let n = min(buf.len(), self.buf.len() - self.pos);
-        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        u32::try_from(n).map(Some).map_err(|_| Error::OutOfMemory)
-    }
-
     fn read_byte(&mut self) -> Result<Option<u8>, Error> {
         if let Some(byte) = self.buf.get(self.pos) {
             self.pos += 1;
@@ -373,7 +362,7 @@ pub(crate) fn decode_header(encoding: Encoding, data: &[u8]) -> Result<Header, E
     let frame = Frame::try_from(payload[0])?;
     let mut flags = [0u8; 4];
     flags.copy_from_slice(&payload[1..=4]);
-    Ok(Header::new(encoding, frame, &flags))
+    Ok(Header::new(encoding, frame, flags))
 }
 
 /// Writes ZRINIT.
@@ -388,7 +377,7 @@ where
     Header::new(
         Encoding::ZHEX,
         Frame::ZRINIT,
-        &[buffer_size[0], buffer_size[1], 0, zrinit.bits()],
+        [buffer_size[0], buffer_size[1], 0, zrinit.bits()],
     )
     .write(port)
 }
@@ -397,7 +386,7 @@ where
 ///
 /// # Errors
 ///
-/// This function returns `Error::Read` or `Error::Write` on an I/O error, or
+/// This function returns `Error::OutOfMemory` if the sink is full, or
 /// `Error::UnsupportedFeature` if `ZHEX` encoding is requested.
 pub(crate) fn write_subpacket<P>(
     port: &mut P,

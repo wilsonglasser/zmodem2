@@ -41,6 +41,7 @@ impl<const CAP: usize> Buffer<CAP> {
 
     /// Returns the capacity of the buffer in bytes.
     #[must_use]
+    #[allow(clippy::unused_self)]
     pub const fn capacity(&self) -> usize {
         CAP
     }
@@ -68,17 +69,6 @@ impl<const CAP: usize> Buffer<CAP> {
             Ok(())
         } else {
             Err(CapacityError)
-        }
-    }
-
-    /// Removes the last byte and returns it to the caller. If the buffer is
-    /// empty, returns `None`.
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.is_empty() {
-            None
-        } else {
-            self.len -= 1;
-            Some(self.bytes[self.len])
         }
     }
 

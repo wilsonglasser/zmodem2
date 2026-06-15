@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2023-2025 Jarkko Sakkinen
 
-use crate::String;
-
 /// Top-level error type.
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "std", derive(thiserror::Error))]
@@ -19,14 +17,10 @@ pub enum Error {
     MalformedHeader,
     #[cfg_attr(feature = "std", error("malformed packet type: {0:#02x}"))]
     MalformedPacket(u8),
-    #[cfg_attr(feature = "std", error("not connected"))]
-    NotConnected,
     #[cfg_attr(feature = "std", error("invalid state"))]
     InvalidState,
     #[cfg_attr(feature = "std", error("backpressure"))]
     Backpressure,
-    #[cfg_attr(feature = "std", error("read: {0}"))]
-    Read(String),
     #[cfg_attr(feature = "std", error("out of memory"))]
     OutOfMemory,
     #[cfg_attr(feature = "std", error("unexpected CRC-16"))]
@@ -37,6 +31,4 @@ pub enum Error {
     UnexpectedEof,
     #[cfg_attr(feature = "std", error("unsupported feature"))]
     UnsupportedFeature,
-    #[cfg_attr(feature = "std", error("write: {0}"))]
-    Write(String),
 }

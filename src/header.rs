@@ -7,7 +7,7 @@
 use crate::buffer::Buffer;
 use crate::crc::{crc16_xmodem, crc32_iso_hdlc};
 use crate::error::Error;
-use crate::io::{Read, Write};
+use crate::io::Write;
 use crate::zdle;
 use crate::{XON, ZDLE, ZPAD};
 use bitflags::bitflags;
@@ -17,18 +17,18 @@ pub(crate) const HEADER_SIZE: usize = 32;
 /// The size of the header payload (frame type + flags).
 pub(crate) const HEADER_PAYLOAD_SIZE: usize = 5;
 
-pub(crate) const ZACK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZACK, &[0; 4]);
-pub(crate) const ZDATA_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZDATA, &[0; 4]);
-pub(crate) const ZEOF_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZEOF, &[0; 4]);
-pub(crate) const ZFIN_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZFIN, &[0; 4]);
-pub(crate) const ZNAK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZNAK, &[0; 4]);
-pub(crate) const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, &[0; 4]);
-pub(crate) const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, &[0; 4]);
+pub(crate) const ZACK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZACK, [0; 4]);
+pub(crate) const ZDATA_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZDATA, [0; 4]);
+pub(crate) const ZEOF_HEADER: Header = Header::new(Encoding::ZBIN32, Frame::ZEOF, [0; 4]);
+pub(crate) const ZFIN_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZFIN, [0; 4]);
+pub(crate) const ZNAK_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZNAK, [0; 4]);
+pub(crate) const ZRPOS_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRPOS, [0; 4]);
+pub(crate) const ZRQINIT_HEADER: Header = Header::new(Encoding::ZHEX, Frame::ZRQINIT, [0; 4]);
 
 /// Data structure for holding a ZMODEM protocol header, which begins a frame,
 /// and is followed optionally by a variable number of subpackets.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Header {
     encoding: Encoding,
     frame: Frame,
@@ -38,39 +38,38 @@ pub struct Header {
 impl Header {
     /// Creates a new instance
     #[must_use]
-    pub const fn new(encoding: Encoding, frame: Frame, flags: &[u8; 4]) -> Self {
+    pub const fn new(encoding: Encoding, frame: Frame, flags: [u8; 4]) -> Self {
         Self {
             encoding,
             frame,
-            flags: *flags,
+            flags,
         }
     }
 
     /// Returns `Encoding` of the frame
     #[must_use]
-    pub const fn encoding(&self) -> Encoding {
+    pub const fn encoding(self) -> Encoding {
         self.encoding
     }
 
     /// Returns `Frame`, containing the frame type
     #[must_use]
-    pub const fn frame(&self) -> Frame {
+    pub const fn frame(self) -> Frame {
         self.frame
     }
 
     /// Returns count for the frame types using this field
     #[must_use]
-    pub const fn count(&self) -> u32 {
+    pub const fn count(self) -> u32 {
         u32::from_le_bytes(self.flags)
     }
 
-    /// Encodes and writes the header to the serial port
+    /// Encodes and writes the header to the sink.
     ///
     /// # Errors
     ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    pub fn write<P>(&self, port: &mut P) -> Result<Option<()>, Error>
+    /// * [`OutOfMemory`](crate::Error::OutOfMemory) when the sink is full
+    pub(crate) fn write<P>(self, port: &mut P) -> Result<Option<()>, Error>
     where
         P: Write + ?Sized,
     {
@@ -107,56 +106,11 @@ impl Header {
         Ok(Some(()))
     }
 
-    /// Reads and decodes a header from the serial port, and returns a new
-    /// instance
-    ///
-    /// # Errors
-    ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    /// * [`UnexpectedCrc16`](crate::Error::UnexpectedCrc16) or
-    ///   [`UnexpectedCrc32`](crate::Error::UnexpectedCrc32) when corrupted data has been detected
-    pub fn read<P>(port: &mut P) -> Result<Option<Header>, Error>
-    where
-        P: Read + ?Sized,
-    {
-        let Some(encoding_byte) = port.read_byte()? else {
-            return Ok(None);
-        };
-        let encoding = Encoding::try_from(encoding_byte)?;
-
-        let mut out_hex: Buffer<HEADER_SIZE> = Buffer::new();
-        for _ in 0..Header::read_size(encoding) {
-            let Some(byte) = read_byte_unescaped(port)? else {
-                return Ok(None);
-            };
-            out_hex.push(byte).map_err(|_| Error::OutOfMemory)?;
-        }
-
-        let mut out: Buffer<HEADER_SIZE> = Buffer::new();
-        if encoding == Encoding::ZHEX {
-            let mut out_bytes = [0u8; HEADER_SIZE / 2];
-            let out_len = out_hex.len() / 2;
-            hex::decode_to_slice(&out_hex, &mut out_bytes[..out_len])
-                .map_err(|_| Error::MalformedHeader)?;
-            out.extend_from_slice(&out_bytes[..out_len])
-                .map_err(|_| Error::OutOfMemory)?;
-        } else {
-            out.extend_from_slice(&out_hex)
-                .map_err(|_| Error::OutOfMemory)?;
-        }
-        check_crc(&out[..5], &out[5..], encoding)?;
-        let frame = Frame::try_from(out[0])?;
-        let mut header = Header::new(encoding, frame, &[0; 4]);
-        header.flags.copy_from_slice(&out[1..=4]);
-        Ok(Some(header))
-    }
-
     /// Returns a new instance with the flags substitude with a count
     /// for the frame types using this field.
     #[must_use]
-    pub const fn with_count(&self, count: u32) -> Self {
-        Header::new(self.encoding, self.frame, &count.to_le_bytes())
+    pub const fn with_count(self, count: u32) -> Self {
+        Header::new(self.encoding, self.frame, count.to_le_bytes())
     }
 
     /// Returns the serialized size of the header payload (payload + CRC)
@@ -336,18 +290,6 @@ fn make_crc(data: &[u8], out: &mut [u8], encoding: Encoding) -> usize {
     }
 }
 
-fn check_crc(data: &[u8], crc: &[u8], encoding: Encoding) -> Result<(), Error> {
-    let mut crc2 = [0u8; 4];
-    let crc2_len = make_crc(data, &mut crc2, encoding);
-    if *crc == crc2[..crc2_len] {
-        Ok(())
-    } else if encoding == Encoding::ZBIN32 {
-        Err(Error::UnexpectedCrc32)
-    } else {
-        Err(Error::UnexpectedCrc16)
-    }
-}
-
 pub(crate) fn write_slice_escaped<P>(port: &mut P, buf: &[u8]) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
@@ -370,21 +312,4 @@ where
         return Ok(None);
     }
     port.write_byte(escaped)
-}
-
-pub(crate) fn read_byte_unescaped<P>(port: &mut P) -> Result<Option<u8>, Error>
-where
-    P: Read + ?Sized,
-{
-    let Some(b) = port.read_byte()? else {
-        return Ok(None);
-    };
-    Ok(Some(if b == ZDLE {
-        let Some(b) = port.read_byte()? else {
-            return Ok(None);
-        };
-        zdle::UNZDLE_TABLE[b as usize]
-    } else {
-        b
-    }))
 }

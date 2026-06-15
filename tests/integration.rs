@@ -15,6 +15,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use zmodem2::{Action, Event, FileInfo, Position};
 
 const FILE_COUNT: usize = 10;
 const FILE_SIZE: usize = 50 * 1024;
@@ -244,37 +245,9 @@ fn test_batch_from_sz() {
     let mut input_offset: usize = 0;
     let mut session_done = false;
 
-    while !session_done || !receiver.drain_outgoing().is_empty() {
+    loop {
         let mut progressed = false;
-
-        if !receiver.drain_outgoing().is_empty() {
-            match port.write(receiver.drain_outgoing()) {
-                Ok(0) => {}
-                Ok(n) => {
-                    receiver.advance_outgoing(n);
-                    progressed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("wire write failed: {e}"),
-            }
-        }
-
-        if !receiver.drain_file().is_empty() {
-            let file_writer: &mut dyn Write = open_files
-                .get_mut(&current_file_name_bytes)
-                .map(|f| f as &mut dyn Write)
-                .unwrap_or(&mut sink);
-
-            match file_writer.write(receiver.drain_file()) {
-                Ok(0) => {}
-                Ok(n) => {
-                    receiver.advance_file(n).unwrap();
-                    progressed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("file write failed: {e}"),
-            }
-        }
+        let mut idle = false;
 
         match port.read(&mut wire_buf) {
             Ok(0) => {}
@@ -286,47 +259,79 @@ fn test_batch_from_sz() {
             Err(e) => panic!("wire read failed: {e}"),
         }
 
-        if receiver.drain_outgoing().is_empty()
-            && receiver.drain_file().is_empty()
-            && input_offset < input_buf.len()
-        {
-            let consumed = receiver.feed_incoming(&input_buf[input_offset..]).unwrap();
-            if consumed > 0 {
-                input_offset += consumed;
-                progressed = true;
-                if input_offset == input_buf.len() {
-                    input_buf.clear();
-                    input_offset = 0;
-                } else if input_offset > 4096 {
-                    input_buf.drain(..input_offset);
-                    input_offset = 0;
+        match receiver.poll() {
+            Action::WriteWire(bytes) => match port.write(bytes) {
+                Ok(0) => {}
+                Ok(n) => {
+                    receiver.wire_written(n);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("wire write failed: {e}"),
+            },
+            Action::WriteFile(bytes) => {
+                let file_writer: &mut dyn Write = open_files
+                    .get_mut(&current_file_name_bytes)
+                    .map(|f| f as &mut dyn Write)
+                    .unwrap_or(&mut sink);
+
+                match file_writer.write(bytes) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        receiver.file_written(n).unwrap();
+                        progressed = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("file write failed: {e}"),
                 }
             }
-        }
-
-        while let Some(event) = receiver.poll_event() {
-            match event {
-                zmodem2::ReceiverEvent::FileStart => {
-                    let name = receiver.file_name();
-                    if name != current_file_name_bytes.as_slice() {
-                        let filename_str = std::str::from_utf8(name).unwrap();
-                        let filename = Path::new(filename_str)
-                            .file_name()
-                            .unwrap()
-                            .to_str()
-                            .unwrap();
-                        let file_path = dest_dir.path().join(filename);
-                        let file = File::create(file_path).unwrap();
-                        open_files.insert(name.to_vec(), MockBlockingFile { file, counter: 0 });
-                        current_file_name_bytes = name.to_vec();
+            Action::Event(event) => {
+                progressed = true;
+                match event {
+                    Event::FileStarted(info) => {
+                        if info.name != current_file_name_bytes.as_slice() {
+                            let filename_str = std::str::from_utf8(info.name).unwrap();
+                            let filename = Path::new(filename_str)
+                                .file_name()
+                                .unwrap()
+                                .to_str()
+                                .unwrap();
+                            let file_path = dest_dir.path().join(filename);
+                            let file = File::create(file_path).unwrap();
+                            open_files
+                                .insert(info.name.to_vec(), MockBlockingFile { file, counter: 0 });
+                            current_file_name_bytes = info.name.to_vec();
+                        }
+                    }
+                    Event::FileCompleted => {}
+                    Event::SessionCompleted => session_done = true,
+                    Event::Aborted => panic!("receiver aborted"),
+                    _ => {}
+                }
+            }
+            Action::ReadFile { .. } => unreachable!("receiver never reads files"),
+            Action::Idle => {
+                idle = true;
+                if input_offset < input_buf.len() {
+                    let consumed = receiver.submit_wire(&input_buf[input_offset..]).unwrap();
+                    if consumed > 0 {
+                        input_offset += consumed;
+                        progressed = true;
+                        if input_offset == input_buf.len() {
+                            input_buf.clear();
+                            input_offset = 0;
+                        } else if input_offset > 4096 {
+                            input_buf.drain(..input_offset);
+                            input_offset = 0;
+                        }
                     }
                 }
-                zmodem2::ReceiverEvent::FileComplete => {}
-                zmodem2::ReceiverEvent::SessionComplete => {
-                    session_done = true;
-                }
-                zmodem2::ReceiverEvent::Aborted => panic!("receiver aborted"),
             }
+            _ => {}
+        }
+
+        if session_done && idle {
+            break;
         }
 
         if !progressed {
@@ -372,7 +377,10 @@ fn test_batch_to_rz() {
     let first_size = first_path.metadata().unwrap().len() as u32;
     let mut sender = zmodem2::Sender::new().unwrap();
     sender
-        .start_file(first_filename.as_bytes(), first_size)
+        .start_file(FileInfo::new(
+            first_filename.as_bytes(),
+            Some(Position::new(first_size)),
+        ))
         .unwrap();
     let mut current_filename = first_filename.to_string();
     let mut wire_buf = [0u8; 4096];
@@ -381,31 +389,9 @@ fn test_batch_to_rz() {
     let mut file_buf = [0u8; 1024];
     let mut session_done = false;
 
-    while !session_done || !sender.drain_outgoing().is_empty() {
+    loop {
         let mut progressed = false;
-
-        if !sender.drain_outgoing().is_empty() {
-            match port.write(sender.drain_outgoing()) {
-                Ok(0) => {}
-                Ok(n) => {
-                    sender.advance_outgoing(n);
-                    progressed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("wire write failed: {e}"),
-            }
-        }
-
-        if let Some(request) = sender.poll_file() {
-            let file = open_files
-                .get_mut(&current_filename)
-                .expect("File not found in map");
-            file.seek(std::io::SeekFrom::Start(u64::from(request.offset)))
-                .unwrap();
-            let n = file.read(&mut file_buf[..request.len]).unwrap();
-            sender.feed_file(&file_buf[..n]).unwrap();
-            progressed = true;
-        }
+        let mut idle = false;
 
         match port.read(&mut wire_buf) {
             Ok(0) => {}
@@ -417,40 +403,73 @@ fn test_batch_to_rz() {
             Err(e) => panic!("wire read failed: {e}"),
         }
 
-        if sender.drain_outgoing().is_empty() && input_offset < input_buf.len() {
-            let consumed = sender.feed_incoming(&input_buf[input_offset..]).unwrap();
-            if consumed > 0 {
-                input_offset += consumed;
+        match sender.poll() {
+            Action::WriteWire(bytes) => match port.write(bytes) {
+                Ok(0) => {}
+                Ok(n) => {
+                    sender.wire_written(n);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("wire write failed: {e}"),
+            },
+            Action::ReadFile { offset, max_len } => {
+                let file = open_files
+                    .get_mut(&current_filename)
+                    .expect("File not found in map");
+                file.seek(std::io::SeekFrom::Start(u64::from(offset.get())))
+                    .unwrap();
+                let n = file.read(&mut file_buf[..max_len]).unwrap();
+                sender.submit_file(&file_buf[..n]).unwrap();
                 progressed = true;
-                if input_offset == input_buf.len() {
-                    input_buf.clear();
-                    input_offset = 0;
-                } else if input_offset > 4096 {
-                    input_buf.drain(..input_offset);
-                    input_offset = 0;
+            }
+            Action::Event(event) => {
+                progressed = true;
+                match event {
+                    Event::FileCompleted => {
+                        if let Some(next_path) = file_iter.next() {
+                            let next_filename = next_path.file_name().unwrap().to_str().unwrap();
+                            let next_size = next_path.metadata().unwrap().len() as u32;
+                            sender
+                                .start_file(FileInfo::new(
+                                    next_filename.as_bytes(),
+                                    Some(Position::new(next_size)),
+                                ))
+                                .unwrap();
+                            current_filename = next_filename.to_string();
+                        } else {
+                            sender.finish().unwrap();
+                        }
+                    }
+                    Event::SessionCompleted => session_done = true,
+                    Event::FileStarted(_) => {}
+                    Event::Aborted => panic!("sender aborted"),
+                    _ => {}
                 }
             }
-        }
-
-        if let Some(event) = sender.poll_event() {
-            match event {
-                zmodem2::SenderEvent::FileComplete => {
-                    if let Some(next_path) = file_iter.next() {
-                        let next_filename = next_path.file_name().unwrap().to_str().unwrap();
-                        let next_size = next_path.metadata().unwrap().len() as u32;
-                        sender
-                            .start_file(next_filename.as_bytes(), next_size)
-                            .unwrap();
-                        current_filename = next_filename.to_string();
-                    } else {
-                        sender.finish_session().unwrap();
+            Action::WriteFile(_) => unreachable!("sender never writes files"),
+            Action::Idle => {
+                idle = true;
+                if input_offset < input_buf.len() {
+                    let consumed = sender.submit_wire(&input_buf[input_offset..]).unwrap();
+                    if consumed > 0 {
+                        input_offset += consumed;
+                        progressed = true;
+                        if input_offset == input_buf.len() {
+                            input_buf.clear();
+                            input_offset = 0;
+                        } else if input_offset > 4096 {
+                            input_buf.drain(..input_offset);
+                            input_offset = 0;
+                        }
                     }
                 }
-                zmodem2::SenderEvent::SessionComplete => {
-                    session_done = true;
-                }
-                zmodem2::SenderEvent::Aborted => panic!("sender aborted"),
             }
+            _ => {}
+        }
+
+        if session_done && idle {
+            break;
         }
 
         if !progressed {

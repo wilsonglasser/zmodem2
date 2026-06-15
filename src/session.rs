@@ -8,20 +8,20 @@ use crate::wire::SubpacketType;
 
 /// A request for file data from the sender.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FileRequest {
+pub(crate) struct FileRequest {
     pub offset: u32,
     pub len: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SenderEvent {
+pub(crate) enum SenderEvent {
     FileComplete,
     SessionComplete,
     Aborted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ReceiverEvent {
+pub(crate) enum ReceiverEvent {
     FileStart,
     FileComplete,
     SessionComplete,

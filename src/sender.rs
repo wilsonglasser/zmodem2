@@ -4,7 +4,7 @@
 
 //! ZMODEM sender state machine.
 
-use crate::api::{Effect, Input, Position, Progress, SessionEvent};
+use crate::api::{Action, Event, FileInfo, Position};
 use crate::buffer::Buffer;
 use crate::error::Error;
 use crate::file::write_zfile;
@@ -45,7 +45,7 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
+    /// * [`OutOfMemory`](crate::Error::OutOfMemory) when the outgoing buffer cannot hold the handshake
     pub fn new() -> Result<Self, Error> {
         let mut sender = Self {
             state: SenderPhase::WaitReceiverInit,
@@ -70,10 +70,20 @@ impl Sender {
 
     /// Starts sending a file with the provided metadata.
     ///
+    /// The file size must be known; [`FileInfo`] with no size is rejected with
+    /// [`UnsupportedFeature`](crate::Error::UnsupportedFeature).
+    ///
     /// # Errors
     ///
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    pub fn start_file(&mut self, file_name: &[u8], file_size: u32) -> Result<(), Error> {
+    /// * [`UnsupportedFeature`](crate::Error::UnsupportedFeature) when the size is unknown
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still pending
+    /// * [`InvalidState`](crate::Error::InvalidState) when a transfer is already in progress
+    pub fn start_file(&mut self, info: FileInfo) -> Result<(), Error> {
+        let Some(size) = info.size else {
+            return Err(Error::UnsupportedFeature);
+        };
+        let file_name = info.name;
+        let file_size = size.get();
         if matches!(self.state, SenderPhase::Done | SenderPhase::WaitFinish)
             || (!matches!(
                 self.state,
@@ -107,8 +117,8 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    pub fn finish_session(&mut self) -> Result<(), Error> {
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still pending
+    pub fn finish(&mut self) -> Result<(), Error> {
         self.finish_requested = true;
         if self.state == SenderPhase::ReadyForFile {
             if self.outgoing() {
@@ -120,18 +130,14 @@ impl Sender {
         Ok(())
     }
 
-    /// Returns a pending file data request, if any.
-    #[must_use]
-    pub fn poll_file(&self) -> Option<FileRequest> {
-        self.pending_request
-    }
-
-    /// Feeds a chunk of file data for the current request.
+    /// Provides a chunk of file data for the current [`Action::ReadFile`] request.
     ///
     /// # Errors
     ///
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
-    pub fn feed_file(&mut self, data: &[u8]) -> Result<(), Error> {
+    /// * [`InvalidState`](crate::Error::InvalidState) when no read request is pending
+    /// * [`UnexpectedEof`](crate::Error::UnexpectedEof) when the chunk is empty or too large
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still pending
+    pub fn submit_file(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.state != SenderPhase::NeedFileData {
             return Err(Error::InvalidState);
         }
@@ -187,17 +193,15 @@ impl Sender {
         Ok(())
     }
 
-    /// Feeds incoming wire data into the state machine.
+    /// Submits incoming wire data into the state machine.
     ///
     /// Returns the number of bytes consumed.
     ///
     /// # Errors
     ///
-    /// * [`Read`](crate::Error::Read) when the read I/O fails with the serial port
-    /// * [`Write`](crate::Error::Write) when the write I/O fails with the serial port
     /// * [`UnexpectedCrc16`](crate::Error::UnexpectedCrc16) or
     ///   [`UnexpectedCrc32`](crate::Error::UnexpectedCrc32) when corrupted data has been detected
-    pub fn feed_incoming(&mut self, input: &[u8]) -> Result<usize, Error> {
+    pub fn submit_wire(&mut self, input: &[u8]) -> Result<usize, Error> {
         let mut reader = SliceReader::new(input);
 
         loop {
@@ -227,13 +231,13 @@ impl Sender {
     }
 
     /// Returns pending outgoing bytes.
-    #[must_use]
-    pub fn drain_outgoing(&self) -> &[u8] {
+    fn drain_outgoing(&self) -> &[u8] {
         &self.outgoing[self.outgoing_offset..]
     }
 
-    /// Advances the outgoing cursor by `n` bytes.
-    pub fn advance_outgoing(&mut self, n: usize) {
+    /// Reports that `n` outgoing bytes from the last [`Action::WriteWire`] were
+    /// written to the transport.
+    pub fn wire_written(&mut self, n: usize) {
         let remaining = self.outgoing.len().saturating_sub(self.outgoing_offset);
         let n = min(n, remaining);
         self.outgoing_offset += n;
@@ -243,80 +247,54 @@ impl Sender {
         }
     }
 
-    /// Returns the next pending sender event.
-    pub fn poll_event(&mut self) -> Option<SenderEvent> {
-        self.pending_event.take()
-    }
-
-    /// Advances the sender with one 0.6 step/effect API input.
+    /// Signals that the protocol response timeout expired.
+    ///
+    /// While still waiting for the receiver to initialize, this re-queues the
+    /// `ZRQINIT` handshake.
     ///
     /// # Errors
     ///
-    /// Returns protocol, state, and I/O errors from the underlying sender.
-    pub fn step<'a>(&'a mut self, input: Input<'a>) -> Result<Progress<'a>, Error> {
-        match input {
-            Input::Wire(bytes) => {
-                let consumed = self.feed_incoming(bytes)?;
-                if consumed == 0 {
-                    Ok(self.next_progress())
-                } else {
-                    Ok(Progress::Consumed(consumed))
-                }
-            }
-            Input::FileData(data) => {
-                self.feed_file(data)?;
-                Ok(self.next_progress())
-            }
-            Input::StartFile(info) => {
-                let Some(size) = info.size else {
-                    return Err(Error::UnsupportedFeature);
-                };
-                self.start_file(info.name, size.get())?;
-                Ok(self.next_progress())
-            }
-            Input::OutgoingAdvanced(count) => {
-                self.advance_outgoing(count);
-                Ok(self.next_progress())
-            }
-            Input::Finish => {
-                self.finish_session()?;
-                Ok(self.next_progress())
-            }
-            Input::Timeout if self.state == SenderPhase::WaitReceiverInit && !self.outgoing() => {
-                self.queue_zrqinit()?;
-                Ok(self.next_progress())
-            }
-            Input::Abort => {
-                self.state = SenderPhase::Done;
-                self.pending_request = None;
-                self.pending_event = Some(SenderEvent::Aborted);
-                Ok(self.next_progress())
-            }
-            Input::FileAdvanced(_) | Input::Timeout => Err(Error::InvalidState),
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still pending
+    pub fn timeout(&mut self) -> Result<(), Error> {
+        if self.state == SenderPhase::WaitReceiverInit && !self.outgoing() {
+            self.queue_zrqinit()?;
         }
+        Ok(())
     }
 
-    fn next_progress(&mut self) -> Progress<'_> {
-        if let Some(event) = self.poll_event() {
-            return Progress::Effect(Effect::Event(match event {
-                SenderEvent::FileComplete => SessionEvent::FileCompleted,
-                SenderEvent::SessionComplete => SessionEvent::SessionCompleted,
-                SenderEvent::Aborted => SessionEvent::Aborted,
-            }));
-        }
+    /// Aborts the current session.
+    pub fn abort(&mut self) {
+        self.state = SenderPhase::Done;
+        self.pending_request = None;
+        self.pending_event = Some(SenderEvent::Aborted);
+    }
 
-        if self.outgoing() {
-            return Progress::Effect(Effect::WriteWire(self.drain_outgoing()));
-        }
-
-        if let Some(request) = self.poll_file() {
-            return Progress::Effect(Effect::ReadFile {
-                offset: Position::new(request.offset),
-                max_len: request.len,
+    /// Returns the next action the caller must perform.
+    ///
+    /// Pending events take priority, followed by outgoing wire bytes, then a
+    /// file read request, and finally [`Action::Idle`] when there is no
+    /// immediate work.
+    pub fn poll(&mut self) -> Action<'_> {
+        if let Some(event) = self.pending_event.take() {
+            return Action::Event(match event {
+                SenderEvent::FileComplete => Event::FileCompleted,
+                SenderEvent::SessionComplete => Event::SessionCompleted,
+                SenderEvent::Aborted => Event::Aborted,
             });
         }
 
-        Progress::Idle
+        if self.outgoing() {
+            return Action::WriteWire(self.drain_outgoing());
+        }
+
+        if let Some(request) = self.pending_request {
+            return Action::ReadFile {
+                offset: Position::new(request.offset),
+                max_len: request.len,
+            };
+        }
+
+        Action::Idle
     }
 
     fn outgoing(&self) -> bool {

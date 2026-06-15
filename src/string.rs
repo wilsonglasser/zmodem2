@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2023-2025 Jarkko Sakkinen
 
-use super::{Buffer, CapacityError};
+use crate::buffer::{Buffer, CapacityError};
 use core::{
     cmp::min,
     fmt,
@@ -53,12 +53,6 @@ impl String {
     /// Resets buffer length back to zero.
     pub fn clear(&mut self) {
         self.0.clear();
-    }
-
-    /// Returns the capacity of the buffer in bytes.
-    #[must_use]
-    pub const fn capacity(&self) -> usize {
-        self.0.capacity()
     }
 
     /// Copies bytes from a slice to the end of the buffer.

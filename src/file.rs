@@ -48,7 +48,7 @@ where
 
     write!(buf, "{size}\0").map_err(|_| Error::OutOfMemory)?;
 
-    if Header::new(Encoding::ZBIN32, Frame::ZFILE, &[0; 4])
+    if Header::new(Encoding::ZBIN32, Frame::ZFILE, [0; 4])
         .write(port)?
         .is_none()
     {
