@@ -433,7 +433,7 @@ impl Sender {
     fn update_receiver_caps(&mut self, header: Header) {
         let flags = header.count().to_le_bytes();
         let rx_buf_size = u16::from_le_bytes([flags[0], flags[1]]) as usize;
-        let caps = flags[2] | flags[3];
+        let caps = flags[3];
         let can_ovio = (caps & Zrinit::CANOVIO.bits()) != 0;
 
         if rx_buf_size == 0 {
