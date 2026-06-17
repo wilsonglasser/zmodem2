@@ -84,12 +84,10 @@ impl Sender {
         };
         let file_name = info.name;
         let file_size = size.get();
-        if matches!(self.state, SenderPhase::Done | SenderPhase::WaitFinish)
-            || (!matches!(
-                self.state,
-                SenderPhase::WaitReceiverInit | SenderPhase::ReadyForFile
-            ))
-        {
+        if !matches!(
+            self.state,
+            SenderPhase::WaitReceiverInit | SenderPhase::ReadyForFile
+        ) {
             return Err(Error::InvalidState);
         }
 
