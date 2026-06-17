@@ -82,7 +82,7 @@ impl Receiver {
         let mut reader = SliceReader::new(input);
 
         loop {
-            if self.outgoing() || !self.drain_file().is_empty() || self.pending_events_full() {
+            if self.blocked() {
                 break;
             }
 
@@ -94,10 +94,7 @@ impl Receiver {
             ) {
                 match self.process_subpacket(&mut reader) {
                     Ok(Some(())) => {
-                        if self.outgoing()
-                            || !self.drain_file().is_empty()
-                            || self.pending_events_full()
-                        {
+                        if self.blocked() {
                             break;
                         }
                         if reader.consumed() == before {
@@ -243,6 +240,12 @@ impl Receiver {
 
     fn outgoing(&self) -> bool {
         self.outgoing_offset < self.outgoing.len()
+    }
+
+    /// Returns `true` when no further wire input can be consumed until the
+    /// caller drains outgoing bytes, persists file data, or pops events.
+    fn blocked(&self) -> bool {
+        self.outgoing() || !self.drain_file().is_empty() || self.pending_events_full()
     }
 
     fn pending_events_full(&self) -> bool {
