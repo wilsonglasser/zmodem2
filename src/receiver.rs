@@ -276,6 +276,14 @@ impl Receiver {
         Ok(BufferWriter::new(&mut self.outgoing))
     }
 
+    fn queue_header(&mut self, header: Header) -> Result<(), Error> {
+        let mut writer = self.queue_writer()?;
+        if header.write(&mut writer)?.is_none() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
     fn queue_zrinit(&mut self) -> Result<(), Error> {
         let mut writer = self.queue_writer()?;
         if write_zrinit(&mut writer)?.is_none() {
@@ -285,36 +293,19 @@ impl Receiver {
     }
 
     fn queue_zrpos(&mut self, count: u32) -> Result<(), Error> {
-        let mut writer = self.queue_writer()?;
-        if ZRPOS_HEADER.with_count(count).write(&mut writer)?.is_none() {
-            return Err(Error::OutOfMemory);
-        }
-        Ok(())
+        self.queue_header(ZRPOS_HEADER.with_count(count))
     }
 
     fn queue_zack(&mut self) -> Result<(), Error> {
-        let count = self.count;
-        let mut writer = self.queue_writer()?;
-        if ZACK_HEADER.with_count(count).write(&mut writer)?.is_none() {
-            return Err(Error::OutOfMemory);
-        }
-        Ok(())
+        self.queue_header(ZACK_HEADER.with_count(self.count))
     }
 
     fn queue_zfin(&mut self) -> Result<(), Error> {
-        let mut writer = self.queue_writer()?;
-        if ZFIN_HEADER.write(&mut writer)?.is_none() {
-            return Err(Error::OutOfMemory);
-        }
-        Ok(())
+        self.queue_header(ZFIN_HEADER)
     }
 
     fn queue_nak(&mut self) -> Result<(), Error> {
-        let mut writer = self.queue_writer()?;
-        if ZNAK_HEADER.write(&mut writer)?.is_none() {
-            return Err(Error::OutOfMemory);
-        }
-        Ok(())
+        self.queue_header(ZNAK_HEADER)
     }
 
     fn handle_header(&mut self, header: Header) -> Result<(), Error> {
