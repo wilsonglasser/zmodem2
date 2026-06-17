@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 name = "zmodem2"
 repository = "https://codeberg.org/jarkko/zmodem2.git"
 rust-version = "1.85"
-version = "0.7.0"
+version = "0.7.1"
 build = "build.rs"
 
 [features]
