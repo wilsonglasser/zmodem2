@@ -32,6 +32,9 @@ pub(crate) enum ReceiverEvent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SubpacketPhase {
     Idle,
+    /// Consuming the CR LF XON line trailer that separates a hex
+    /// header from its data subpacket.
+    SkipTrailer,
     Reading,
     Writing(SubpacketType),
     Crc(SubpacketType),
@@ -52,8 +55,10 @@ pub(crate) enum SenderPhase {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ReceiverPhase {
     SessionBegin,
+    SinitReadingData,
     FileBegin,
     FileReadingMetadata,
+    FileAcceptPending,
     FileReadingSubpacket,
     FileWaitingSubpacket,
     SessionEnd,

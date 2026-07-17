@@ -227,6 +227,168 @@ fn feed_receiver_zfile(receiver: &mut Receiver) {
     drain_wire_receiver(receiver);
 }
 
+/// Parses the first header out of raw outgoing wire bytes (which carry
+/// their own `ZPAD`/`ZDLE` framing, unlike [`read_header`]'s input).
+fn parse_first_header(bytes: &[u8]) -> Header {
+    let mut reader = SliceReader::new(bytes);
+    let mut header_reader = HeaderReader::new();
+    header_reader.read(&mut reader).unwrap().unwrap()
+}
+
+#[test]
+fn test_manual_accept_resumes_from_offset() {
+    let mut receiver = Receiver::new().unwrap();
+    receiver.set_manual_file_accept(true);
+    feed_receiver_zfile(&mut receiver);
+
+    // The decision is pending: no ZRPOS may leave until the caller
+    // accepts, and data-phase calls are rejected.
+    assert_eq!(receiver.poll(), Action::Idle);
+
+    receiver.accept_file_at(64).unwrap();
+    let (header, n) = match receiver.poll() {
+        Action::WriteWire(bytes) => (parse_first_header(bytes), bytes.len()),
+        other => panic!("unexpected action: {other:?}"),
+    };
+    receiver.wire_written(n);
+    assert_eq!(header.frame(), Frame::ZRPOS);
+    assert_eq!(header.count(), 64);
+
+    // Data arriving at the resumed offset is accepted and surfaced.
+    let mut wire = write_header(Header::new(
+        Encoding::ZBIN32,
+        Frame::ZDATA,
+        64u32.to_le_bytes(),
+    ));
+    wire.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"hello"));
+    let mut offset = 0;
+    let mut got = Vec::new();
+    while got.is_empty() {
+        match receiver.poll() {
+            Action::WriteWire(bytes) => {
+                let n = bytes.len();
+                receiver.wire_written(n);
+            }
+            Action::WriteFile(bytes) => {
+                got = bytes.to_vec();
+                let n = bytes.len();
+                receiver.file_written(n).unwrap();
+            }
+            Action::Idle => {
+                assert!(offset < wire.len(), "ran out of input before file data");
+                let consumed = receiver.submit_wire(&wire[offset..]).unwrap();
+                assert!(consumed > 0);
+                offset += consumed;
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+    assert_eq!(got, b"hello");
+}
+
+#[test]
+fn test_manual_accept_can_skip_a_file() {
+    let mut receiver = Receiver::new().unwrap();
+    receiver.set_manual_file_accept(true);
+    feed_receiver_zfile(&mut receiver);
+
+    receiver.skip_file().unwrap();
+    let (header, n) = match receiver.poll() {
+        Action::WriteWire(bytes) => (parse_first_header(bytes), bytes.len()),
+        other => panic!("unexpected action: {other:?}"),
+    };
+    receiver.wire_written(n);
+    assert_eq!(header.frame(), Frame::ZSKIP);
+
+    // Out of the pending state, further decisions are invalid.
+    assert_eq!(receiver.accept_file_at(0), Err(Error::InvalidState));
+    assert_eq!(receiver.skip_file(), Err(Error::InvalidState));
+}
+
+#[test]
+fn test_zsinit_is_acknowledged() {
+    let mut receiver = Receiver::new().unwrap();
+    drain_wire_receiver(&mut receiver);
+
+    // lrzsz's `sz -e` opens with ZSINIT plus an attn-string subpacket
+    // and blocks until the receiver acknowledges it.
+    let mut wire = write_header(Header::new(Encoding::ZBIN32, Frame::ZSINIT, [0; 4]));
+    wire.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCW, b"\x00"));
+
+    let mut offset = 0;
+    let mut acked = false;
+    while !acked {
+        match receiver.poll() {
+            Action::WriteWire(bytes) => {
+                let header = parse_first_header(bytes);
+                let n = bytes.len();
+                receiver.wire_written(n);
+                if header.frame() == Frame::ZACK {
+                    acked = true;
+                }
+            }
+            Action::Idle => {
+                assert!(offset < wire.len(), "input ran out before the ZACK");
+                let consumed = receiver.submit_wire(&wire[offset..]).unwrap();
+                assert!(consumed > 0);
+                offset += consumed;
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    // The handshake continues normally afterwards.
+    feed_receiver_zfile(&mut receiver);
+}
+
+/// Byte-exact ZSINIT opening captured from lrzsz's `sz -b -e` (after
+/// receiving a CANFC32 ZRINIT): a ZHEX header, its CR LF(high-bit) XON
+/// line trailer, then a BINARY CRC16 subpacket with the empty attn
+/// string. The hex encoding maps to CRC16 data and the trailer must be
+/// skipped; both mistakes surfaced as UnexpectedCrc16 against the real
+/// tool.
+#[test]
+fn test_zsinit_hex_header_from_lrzsz_is_acknowledged() {
+    const LRZSZ_ZSINIT: &[u8] = &[
+        0x2a, 0x2a, 0x18, 0x42, // ** ZDLE 'B'
+        0x30, 0x32, // "02" ZSINIT
+        0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x34, 0x30, // flags "00000040" (ESCCTL)
+        0x30, 0x63, 0x34, 0x37, // crc "0c47"
+        0x0d, 0x8a, 0x11, // CR LF|0x80 XON line trailer
+        0x18, 0x40, // escaped NUL (empty attn string)
+        0x18, 0x6b, // ZDLE ZCRCW
+        0xdd, 0xcd, // CRC16
+        0x11, // trailing XON
+    ];
+    let mut receiver = Receiver::new().unwrap();
+    drain_wire_receiver(&mut receiver);
+
+    let mut offset = 0;
+    let mut acked = false;
+    while !acked {
+        match receiver.poll() {
+            Action::WriteWire(bytes) => {
+                let header = parse_first_header(bytes);
+                let n = bytes.len();
+                receiver.wire_written(n);
+                if header.frame() == Frame::ZACK {
+                    acked = true;
+                }
+            }
+            Action::Idle => {
+                assert!(offset < LRZSZ_ZSINIT.len(), "input ran out before the ZACK");
+                let consumed = receiver.submit_wire(&LRZSZ_ZSINIT[offset..]).unwrap();
+                assert!(consumed > 0);
+                offset += consumed;
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    // The handshake continues normally afterwards.
+    feed_receiver_zfile(&mut receiver);
+}
+
 #[test]
 fn test_sender_resumes_from_zrpos() {
     let mut sender = Sender::new().unwrap();
@@ -411,14 +573,6 @@ fn test_abort_event() {
 
     sender.abort();
     assert_eq!(sender.poll(), Action::Event(Event::Aborted));
-}
-
-/// Parses the first header out of raw outgoing wire bytes (which carry
-/// their own `ZPAD`/`ZDLE` framing, unlike [`read_header`]'s input).
-fn parse_first_header(bytes: &[u8]) -> Header {
-    let mut reader = SliceReader::new(bytes);
-    let mut header_reader = HeaderReader::new();
-    header_reader.read(&mut reader).unwrap().unwrap()
 }
 
 #[test]

@@ -41,6 +41,7 @@ pub struct Receiver {
     pending_event_len: usize,
     buffer_len: u16,
     overlapped_io: bool,
+    manual_accept: bool,
 }
 
 impl Receiver {
@@ -103,9 +104,64 @@ impl Receiver {
             pending_event_len: 0,
             buffer_len,
             overlapped_io,
+            manual_accept: false,
         };
         receiver.queue_zrinit()?;
         Ok(receiver)
+    }
+
+    /// Enables or disables manual file acceptance.
+    ///
+    /// In the default automatic mode every announced file is accepted
+    /// from offset zero as soon as its ZFILE metadata parses. In
+    /// manual mode the receiver instead pauses after emitting
+    /// [`Event::FileStarted`] and waits for the caller to decide:
+    /// [`Receiver::accept_file_at`] requests the file from a given
+    /// offset (resuming an existing partial download), and
+    /// [`Receiver::skip_file`] declines it (ZSKIP). While a decision
+    /// is pending, [`Receiver::poll`] returns [`Action::Idle`] and no
+    /// wire bytes are produced.
+    pub fn set_manual_file_accept(&mut self, manual: bool) {
+        self.manual_accept = manual;
+    }
+
+    /// Accepts the file announced by the pending [`Event::FileStarted`]
+    /// and asks the sender to start at `offset` (ZRPOS).
+    ///
+    /// Zero requests the whole file; a nonzero offset resumes a
+    /// partial transfer, and the caller is responsible for appending
+    /// the incoming data to its existing `offset` bytes.
+    ///
+    /// # Errors
+    ///
+    /// * [`InvalidState`](crate::Error::InvalidState) when no file is awaiting acceptance
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still
+    ///   pending (drain and retry; the acceptance state is unchanged)
+    pub fn accept_file_at(&mut self, offset: u32) -> Result<(), Error> {
+        if self.state != ReceiverPhase::FileAcceptPending {
+            return Err(Error::InvalidState);
+        }
+        self.queue_zrpos(offset)?;
+        self.count = offset;
+        self.state = ReceiverPhase::FileBegin;
+        Ok(())
+    }
+
+    /// Declines the file announced by the pending [`Event::FileStarted`]
+    /// (ZSKIP); the sender moves on to its next file or finishes.
+    ///
+    /// # Errors
+    ///
+    /// * [`InvalidState`](crate::Error::InvalidState) when no file is awaiting acceptance
+    /// * [`Backpressure`](crate::Error::Backpressure) when outgoing bytes are still
+    ///   pending (drain and retry; the acceptance state is unchanged)
+    pub fn skip_file(&mut self) -> Result<(), Error> {
+        if self.state != ReceiverPhase::FileAcceptPending {
+            return Err(Error::InvalidState);
+        }
+        self.queue_header(Header::new(Encoding::ZHEX, Frame::ZSKIP, [0; 4]))?;
+        self.state = ReceiverPhase::FileBegin;
+        Ok(())
     }
 
     /// Submits incoming wire data into the state machine.
@@ -128,7 +184,9 @@ impl Receiver {
 
             if matches!(
                 self.state,
-                ReceiverPhase::FileReadingSubpacket | ReceiverPhase::FileReadingMetadata
+                ReceiverPhase::FileReadingSubpacket
+                    | ReceiverPhase::FileReadingMetadata
+                    | ReceiverPhase::SinitReadingData
             ) {
                 match self.process_subpacket(&mut reader) {
                     Ok(Some(())) => {
@@ -355,6 +413,29 @@ impl Receiver {
             Frame::ZRQINIT | Frame::ZDATA if self.state == ReceiverPhase::SessionBegin => {
                 self.queue_zrinit()?;
             }
+            Frame::ZSINIT if self.state == ReceiverPhase::SessionBegin => {
+                // ZSINIT (e.g. lrzsz's `sz -e`) is followed by a data
+                // subpacket with the attn string; read it so it is not
+                // misparsed as headers, then acknowledge (see the
+                // SinitReadingData completion). lrzsz sends the header
+                // as ZHEX: there is no hex data encoding on the wire,
+                // the subpacket that follows is binary with CRC16, and
+                // the hex line trailer before it must be skipped.
+                self.data_encoding = match header.encoding() {
+                    Encoding::ZHEX => Encoding::ZBIN,
+                    other => other,
+                };
+                self.state = ReceiverPhase::SinitReadingData;
+                self.subpacket_state = if header.encoding() == Encoding::ZHEX {
+                    SubpacketPhase::SkipTrailer
+                } else {
+                    SubpacketPhase::Reading
+                };
+                self.subpacket_escape_pending = false;
+                self.crc.reset();
+                self.buf.clear();
+                self.buf_write_offset = 0;
+            }
             Frame::ZFILE
                 if matches!(
                     self.state,
@@ -444,45 +525,54 @@ impl Receiver {
         Ok(())
     }
 
-    /// Handles reading a single byte for the `SubpacketPhase::Reading` state.
-    fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
+    /// Handles the byte after a `ZDLE`: either a subpacket terminator
+    /// or an escaped data byte.
+    fn receive_subpacket_followup_byte(&mut self, byte: u8) -> Result<Option<()>, Error> {
+        if let Ok(packet) = SubpacketType::try_from(byte) {
+            self.crc.update(packet as u8, self.data_encoding);
+            self.subpacket_state = SubpacketPhase::Crc(packet);
+        } else {
+            let unescaped = zdle::UNZDLE_TABLE[byte as usize];
+            self.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
+            self.crc.update(unescaped, self.data_encoding);
+        }
+        Ok(Some(()))
+    }
+
+    /// Handles a plain (non-escape-continuation) subpacket byte.
+    fn receive_subpacket_plain_byte<P>(&mut self, port: &mut P, byte: u8) -> Result<Option<()>, Error>
     where
         P: Read + ?Sized,
     {
-        let handle_followup = |this: &mut Self, byte: u8| -> Result<Option<()>, Error> {
-            if let Ok(packet) = SubpacketType::try_from(byte) {
-                this.crc.update(packet as u8, this.data_encoding);
-                this.subpacket_state = SubpacketPhase::Crc(packet);
-            } else {
-                let unescaped = zdle::UNZDLE_TABLE[byte as usize];
-                this.buf.push(unescaped).map_err(|_| Error::OutOfMemory)?;
-                this.crc.update(unescaped, this.data_encoding);
-            }
-            Ok(Some(()))
-        };
-
-        if self.subpacket_escape_pending {
-            let Some(byte) = port.read_byte()? else {
-                return Ok(None);
-            };
-            self.subpacket_escape_pending = false;
-            return handle_followup(self, byte);
-        }
-
-        let Some(byte) = port.read_byte()? else {
-            return Ok(None);
-        };
         if byte == ZDLE {
             let Some(next) = port.read_byte()? else {
                 self.subpacket_escape_pending = true;
                 return Ok(None);
             };
-            return handle_followup(self, next);
+            return self.receive_subpacket_followup_byte(next);
         }
-
         self.buf.push(byte).map_err(|_| Error::OutOfMemory)?;
         self.crc.update(byte, self.data_encoding);
         Ok(Some(()))
+    }
+
+    /// Handles reading a single byte for the `SubpacketPhase::Reading` state.
+    fn receive_subpacket_data_byte<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
+    where
+        P: Read + ?Sized,
+    {
+        if self.subpacket_escape_pending {
+            let Some(byte) = port.read_byte()? else {
+                return Ok(None);
+            };
+            self.subpacket_escape_pending = false;
+            return self.receive_subpacket_followup_byte(byte);
+        }
+
+        let Some(byte) = port.read_byte()? else {
+            return Ok(None);
+        };
+        self.receive_subpacket_plain_byte(port, byte)
     }
 
     fn process_subpacket<P>(&mut self, port: &mut P) -> Result<Option<()>, Error>
@@ -490,6 +580,23 @@ impl Receiver {
         P: Read + ?Sized,
     {
         match self.subpacket_state {
+            SubpacketPhase::SkipTrailer => {
+                // A hex header ends with a CR LF (possibly with the
+                // high bit set) XON line trailer that sits between the
+                // header and its data subpacket; those bytes are
+                // framing, not payload. The first payload byte flips
+                // to `Reading` and is processed in place.
+                loop {
+                    let Some(byte) = port.read_byte()? else {
+                        return Ok(None);
+                    };
+                    if matches!(byte, 0x0d | 0x0a | 0x8d | 0x8a | 0x11 | 0x13 | 0x91 | 0x93) {
+                        continue;
+                    }
+                    self.subpacket_state = SubpacketPhase::Reading;
+                    return self.receive_subpacket_plain_byte(port, byte);
+                }
+            }
             SubpacketPhase::Reading => self.receive_subpacket_data_byte(port),
             SubpacketPhase::Crc(packet) => {
                 if self.crc.process(port, self.data_encoding)?.is_none() {
@@ -503,11 +610,29 @@ impl Receiver {
                     self.crc.reset();
                     self.subpacket_escape_pending = false;
 
-                    self.queue_zrpos(0)?;
-
-                    self.state = ReceiverPhase::FileBegin;
+                    if self.manual_accept {
+                        // Hold the ZRPOS until the caller decides via
+                        // accept_file_at() / skip_file().
+                        self.state = ReceiverPhase::FileAcceptPending;
+                    } else {
+                        self.queue_zrpos(0)?;
+                        self.state = ReceiverPhase::FileBegin;
+                    }
                     self.subpacket_state = SubpacketPhase::Idle;
                     self.push_event(ReceiverEvent::FileStart)?;
+                } else if self.state == ReceiverPhase::SinitReadingData {
+                    // ZSINIT's payload (the attn string) carries nothing
+                    // we act on, but the sender blocks until the frame
+                    // is acknowledged.
+                    self.buf.clear();
+                    self.buf_write_offset = 0;
+                    self.crc.reset();
+                    self.subpacket_escape_pending = false;
+
+                    self.queue_header(ZACK_HEADER)?;
+
+                    self.state = ReceiverPhase::SessionBegin;
+                    self.subpacket_state = SubpacketPhase::Idle;
                 } else {
                     self.subpacket_state = SubpacketPhase::Writing(packet);
                     self.buf_write_offset = 0;
