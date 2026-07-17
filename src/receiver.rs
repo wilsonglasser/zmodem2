@@ -39,15 +39,51 @@ pub struct Receiver {
     pending_events: [Option<ReceiverEvent>; RECEIVER_EVENT_QUEUE_CAP],
     pending_event_head: usize,
     pending_event_len: usize,
+    buffer_len: u16,
+    overlapped_io: bool,
 }
 
 impl Receiver {
     /// Create a new receiver instance.
     ///
+    /// Advertises a buffer length of one subpacket (1024 bytes) and no
+    /// overlapped I/O: the sender pauses for an acknowledgement after
+    /// each buffer's worth of data, which suits constrained targets
+    /// that cannot drain the wire while persisting file data. See
+    /// [`Receiver::with_flow_control`] to lift that pacing.
+    ///
     /// # Errors
     ///
     /// * [`OutOfMemory`](crate::Error::OutOfMemory) when the outgoing buffer cannot hold the handshake
     pub fn new() -> Result<Self, Error> {
+        let buffer_len =
+            u16::try_from(SUBPACKET_MAX_SIZE).map_err(|_| Error::UnsupportedFeature)?;
+        Self::with_flow_control(buffer_len, false)
+    }
+
+    /// Create a receiver advertising explicit flow-control
+    /// capabilities in its ZRINIT handshake.
+    ///
+    /// `buffer_len` is the receiver buffer length the sender must
+    /// respect: it will not transmit more than this many bytes without
+    /// waiting for an acknowledgement. Zero advertises nonstop I/O.
+    /// `overlapped_io` advertises `CANOVIO` (storage is written while
+    /// data is being received). Senders such as lrzsz's `sz` require
+    /// both (a zero buffer length and `CANOVIO`) before they stream
+    /// continuously; anything less inserts one round-trip wait per
+    /// buffer of data, which dominates transfer time on links with
+    /// real latency.
+    ///
+    /// Callers that pump [`Receiver::submit_wire`] from a reliable,
+    /// flow-controlled transport (TCP, SSH, a pipe) and persist file
+    /// data promptly should prefer `with_flow_control(0, true)`; the
+    /// conservative [`Receiver::new`] default exists for targets where
+    /// wire input can genuinely overrun the consumer.
+    ///
+    /// # Errors
+    ///
+    /// * [`OutOfMemory`](crate::Error::OutOfMemory) when the outgoing buffer cannot hold the handshake
+    pub fn with_flow_control(buffer_len: u16, overlapped_io: bool) -> Result<Self, Error> {
         let mut receiver = Self {
             state: ReceiverPhase::SessionBegin,
             count: 0,
@@ -65,6 +101,8 @@ impl Receiver {
             pending_events: [None; RECEIVER_EVENT_QUEUE_CAP],
             pending_event_head: 0,
             pending_event_len: 0,
+            buffer_len,
+            overlapped_io,
         };
         receiver.queue_zrinit()?;
         Ok(receiver)
@@ -288,8 +326,9 @@ impl Receiver {
     }
 
     fn queue_zrinit(&mut self) -> Result<(), Error> {
+        let (buffer_len, overlapped_io) = (self.buffer_len, self.overlapped_io);
         let mut writer = self.queue_writer()?;
-        if write_zrinit(&mut writer)?.is_none() {
+        if write_zrinit(&mut writer, buffer_len, overlapped_io)?.is_none() {
             return Err(Error::OutOfMemory);
         }
         Ok(())

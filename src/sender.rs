@@ -38,6 +38,7 @@ pub struct Sender {
     header_reader: HeaderReader,
     pending_event: Option<SenderEvent>,
     finish_requested: bool,
+    streaming_window: usize,
 }
 
 impl Sender {
@@ -63,9 +64,24 @@ impl Sender {
             header_reader: HeaderReader::new(),
             pending_event: None,
             finish_requested: false,
+            streaming_window: SUBPACKET_PER_ACK,
         };
         sender.queue_zrqinit()?;
         Ok(sender)
+    }
+
+    /// Sets the number of subpackets sent per acknowledgement wait when
+    /// the receiver has advertised nonstop I/O (a zero buffer length)
+    /// together with `CANOVIO`.
+    ///
+    /// Defaults to a conservative window of 10. On reliable transports
+    /// (TCP, SSH, a pipe) each wait costs a full round trip, so raising
+    /// the window, or passing `usize::MAX` for fully nonstop streaming,
+    /// removes the dominant latency cost of large transfers. Values
+    /// below 1 are clamped to 1. Has no effect when the receiver
+    /// advertised a bounded buffer, whose pacing is honored as before.
+    pub fn set_streaming_window(&mut self, subpackets: usize) {
+        self.streaming_window = subpackets.max(1);
     }
 
     /// Starts sending a file with the provided metadata.
@@ -438,7 +454,7 @@ impl Sender {
 
         if rx_buf_size == 0 {
             self.max_subpacket_size = SUBPACKET_MAX_SIZE;
-            self.max_subpackets_per_ack = if can_ovio { SUBPACKET_PER_ACK } else { 1 };
+            self.max_subpackets_per_ack = if can_ovio { self.streaming_window } else { 1 };
             return;
         }
 

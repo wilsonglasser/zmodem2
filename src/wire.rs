@@ -365,15 +365,23 @@ pub(crate) fn decode_header(encoding: Encoding, data: &[u8]) -> Result<Header, E
     Ok(Header::new(encoding, frame, flags))
 }
 
-/// Writes ZRINIT.
-pub(crate) fn write_zrinit<P>(port: &mut P) -> Result<Option<()>, Error>
+/// Writes ZRINIT. `buffer_len` is the advertised receiver buffer
+/// length in bytes, where zero means nonstop I/O (the sender may
+/// stream without waiting for acknowledgement); `overlapped_io` adds
+/// `CANOVIO` (storage is written while receiving).
+pub(crate) fn write_zrinit<P>(
+    port: &mut P,
+    buffer_len: u16,
+    overlapped_io: bool,
+) -> Result<Option<()>, Error>
 where
     P: Write + ?Sized,
 {
-    let zrinit = Zrinit::CANFDX | Zrinit::CANFC32;
-    let buffer_size = u16::try_from(SUBPACKET_MAX_SIZE)
-        .map_err(|_| Error::UnsupportedFeature)?
-        .to_le_bytes();
+    let mut zrinit = Zrinit::CANFDX | Zrinit::CANFC32;
+    if overlapped_io {
+        zrinit |= Zrinit::CANOVIO;
+    }
+    let buffer_size = buffer_len.to_le_bytes();
     Header::new(
         Encoding::ZHEX,
         Frame::ZRINIT,

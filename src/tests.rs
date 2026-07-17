@@ -6,7 +6,7 @@
 //! public poll/submit API.
 
 use crate::buffer::Buffer;
-use crate::header::{Encoding, Frame, Header};
+use crate::header::{Encoding, Frame, Header, Zrinit};
 use crate::wire::{BufferWriter, HeaderReader, SliceReader, SubpacketType};
 use crate::{Action, Error, Event, FileInfo, Position, Receiver, Sender, ZDLE, ZPAD};
 use rstest::rstest;
@@ -411,4 +411,114 @@ fn test_abort_event() {
 
     sender.abort();
     assert_eq!(sender.poll(), Action::Event(Event::Aborted));
+}
+
+/// Parses the first header out of raw outgoing wire bytes (which carry
+/// their own `ZPAD`/`ZDLE` framing, unlike [`read_header`]'s input).
+fn parse_first_header(bytes: &[u8]) -> Header {
+    let mut reader = SliceReader::new(bytes);
+    let mut header_reader = HeaderReader::new();
+    header_reader.read(&mut reader).unwrap().unwrap()
+}
+
+#[test]
+fn test_zrinit_advertises_configured_flow_control() {
+    // Default construction is unchanged: one-subpacket buffer, no
+    // CANOVIO.
+    let mut receiver = Receiver::new().unwrap();
+    let header = match receiver.poll() {
+        Action::WriteWire(bytes) => parse_first_header(bytes),
+        other => panic!("unexpected action: {other:?}"),
+    };
+    let flags = header.count().to_le_bytes();
+    assert_eq!(u16::from_le_bytes([flags[0], flags[1]]), 1024);
+    assert_eq!(flags[3] & Zrinit::CANOVIO.bits(), 0);
+
+    // Streaming configuration: zero buffer length plus CANOVIO, the
+    // combination lrzsz's `sz` requires before it streams nonstop.
+    let mut receiver = Receiver::with_flow_control(0, true).unwrap();
+    let header = match receiver.poll() {
+        Action::WriteWire(bytes) => parse_first_header(bytes),
+        other => panic!("unexpected action: {other:?}"),
+    };
+    let flags = header.count().to_le_bytes();
+    assert_eq!(u16::from_le_bytes([flags[0], flags[1]]), 0);
+    assert_ne!(flags[3] & Zrinit::CANOVIO.bits(), 0);
+}
+
+/// Runs an upload against a simulated nonstop receiver (zero buffer,
+/// CANOVIO) and returns how many ZCRCW (wait-for-ack) data subpackets
+/// went out (the ZFILE frame is drained before counting starts).
+fn count_zcrcw_waits(window: Option<usize>, file_len: usize) -> usize {
+    let mut sender = Sender::new().unwrap();
+    if let Some(window) = window {
+        sender.set_streaming_window(window);
+    }
+    drain_wire_sender(&mut sender);
+    sender
+        .start_file(FileInfo::new(
+            b"stream.bin",
+            Some(Position::new(u32::try_from(file_len).unwrap())),
+        ))
+        .unwrap();
+
+    let mut flags = [0u8; 4];
+    flags[3] = (Zrinit::CANFDX | Zrinit::CANFC32 | Zrinit::CANOVIO).bits();
+    let zrinit = write_header(Header::new(Encoding::ZHEX, Frame::ZRINIT, flags));
+    assert!(sender.submit_wire(&zrinit).unwrap() > 0);
+    drain_wire_sender(&mut sender);
+    let zrpos = write_header(Header::new(
+        Encoding::ZHEX,
+        Frame::ZRPOS,
+        0u32.to_le_bytes(),
+    ));
+    assert!(sender.submit_wire(&zrpos).unwrap() > 0);
+
+    let mut zcrcw = 0usize;
+    let mut sent = 0usize;
+    loop {
+        match sender.poll() {
+            Action::WriteWire(bytes) => {
+                // A literal ZDLE in escaped data never precedes 0x6b,
+                // so this exact pair only matches subpacket terminators.
+                zcrcw += bytes
+                    .windows(2)
+                    .filter(|pair| pair == &[ZDLE, SubpacketType::ZCRCW as u8])
+                    .count();
+                let n = bytes.len();
+                sender.wire_written(n);
+            }
+            Action::ReadFile { offset, max_len } => {
+                let remaining = file_len - offset.get() as usize;
+                let n = remaining.min(max_len);
+                sender.submit_file(&vec![0u8; n]).unwrap();
+                sent += n;
+            }
+            Action::Idle => {
+                if sent >= file_len {
+                    break;
+                }
+                // Mid-file idle means the machine is waiting out a
+                // ZCRCW; acknowledge it like a receiver would.
+                let zack = write_header(Header::new(
+                    Encoding::ZHEX,
+                    Frame::ZACK,
+                    u32::try_from(sent).unwrap().to_le_bytes(),
+                ));
+                assert!(sender.submit_wire(&zack).unwrap() > 0);
+            }
+            Action::Event(_) => {}
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+    zcrcw
+}
+
+#[test]
+fn test_streaming_window_controls_ack_cadence() {
+    // 32 KiB = 32 subpackets. Default window (10): waits at
+    // subpackets 10, 20, 30 and the final one.
+    assert_eq!(count_zcrcw_waits(None, 32 * 1024), 4);
+    // Nonstop streaming: only the final subpacket waits.
+    assert_eq!(count_zcrcw_waits(Some(usize::MAX), 32 * 1024), 1);
 }
