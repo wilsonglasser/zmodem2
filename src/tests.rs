@@ -555,6 +555,60 @@ fn test_repeated_corruption_eventually_fails() {
 }
 
 #[test]
+fn test_offset_overflow_is_refused() {
+    let mut receiver = Receiver::new().unwrap();
+    receiver.set_manual_file_accept(true);
+    feed_receiver_zfile(&mut receiver);
+
+    // Resume a few bytes short of the 4 GiB position ceiling, then feed a
+    // subpacket long enough to push the running offset past u32::MAX. The
+    // counter must refuse to wrap (which would rewind the transfer to a
+    // low offset) and surface an error instead.
+    let near = u32::MAX - 4;
+    receiver.accept_file_at(near).unwrap();
+    loop {
+        match receiver.poll() {
+            Action::WriteWire(b) => {
+                let n = b.len();
+                receiver.wire_written(n);
+            }
+            Action::Idle => break,
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    let mut wire = write_header(Header::new(
+        Encoding::ZBIN32,
+        Frame::ZDATA,
+        near.to_le_bytes(),
+    ));
+    wire.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"overflow!"));
+
+    let mut offset = 0;
+    let err = loop {
+        match receiver.poll() {
+            Action::WriteWire(b) => {
+                let n = b.len();
+                receiver.wire_written(n);
+            }
+            Action::WriteFile(b) => {
+                let n = b.len();
+                if let Err(e) = receiver.file_written(n) {
+                    break e;
+                }
+            }
+            Action::Idle => {
+                assert!(offset < wire.len(), "ran out of input before overflow");
+                let consumed = receiver.submit_wire(&wire[offset..]).unwrap();
+                offset += consumed;
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    };
+    assert_eq!(err, Error::OutOfMemory);
+}
+
+#[test]
 fn test_receiver_zcrcq_and_zcrce() {
     let mut receiver = Receiver::new().unwrap();
     feed_receiver_zfile(&mut receiver);

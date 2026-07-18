@@ -697,7 +697,12 @@ impl Receiver {
     }
 
     fn finish_subpacket(&mut self, packet: SubpacketType) -> Result<(), Error> {
-        self.count += u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
+        let len = u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
+        // The running offset is a u32 (ZMODEM positions are 32-bit). A
+        // sender that keeps streaming past 4 GiB, whether buggy or
+        // hostile, must not be able to wrap it back to a low offset and
+        // desynchronise the transfer: refuse instead.
+        self.count = self.count.checked_add(len).ok_or(Error::OutOfMemory)?;
         self.buf.clear();
         self.buf_write_offset = 0;
         self.crc.reset();
