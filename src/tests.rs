@@ -603,7 +603,7 @@ fn test_zrinit_advertises_configured_flow_control() {
 /// Runs an upload against a simulated nonstop receiver (zero buffer,
 /// CANOVIO) and returns how many ZCRCW (wait-for-ack) data subpackets
 /// went out (the ZFILE frame is drained before counting starts).
-fn count_zcrcw_waits(window: Option<usize>, file_len: usize) -> usize {
+fn count_zcrcw_waits(window: Option<usize>, window_after: Option<usize>, file_len: usize) -> usize {
     let mut sender = Sender::new().unwrap();
     if let Some(window) = window {
         sender.set_streaming_window(window);
@@ -620,6 +620,11 @@ fn count_zcrcw_waits(window: Option<usize>, file_len: usize) -> usize {
     flags[3] = (Zrinit::CANFDX | Zrinit::CANFC32 | Zrinit::CANOVIO).bits();
     let zrinit = write_header(Header::new(Encoding::ZHEX, Frame::ZRINIT, flags));
     assert!(sender.submit_wire(&zrinit).unwrap() > 0);
+    // Setting the window after ZRINIT must still change the ack cadence:
+    // the negotiated pacing is recomputed on the fly.
+    if let Some(window) = window_after {
+        sender.set_streaming_window(window);
+    }
     drain_wire_sender(&mut sender);
     let zrpos = write_header(Header::new(
         Encoding::ZHEX,
@@ -672,7 +677,154 @@ fn count_zcrcw_waits(window: Option<usize>, file_len: usize) -> usize {
 fn test_streaming_window_controls_ack_cadence() {
     // 32 KiB = 32 subpackets. Default window (10): waits at
     // subpackets 10, 20, 30 and the final one.
-    assert_eq!(count_zcrcw_waits(None, 32 * 1024), 4);
+    assert_eq!(count_zcrcw_waits(None, None, 32 * 1024), 4);
     // Nonstop streaming: only the final subpacket waits.
-    assert_eq!(count_zcrcw_waits(Some(usize::MAX), 32 * 1024), 1);
+    assert_eq!(count_zcrcw_waits(Some(usize::MAX), None, 32 * 1024), 1);
+}
+
+#[test]
+fn test_streaming_window_applies_after_zrinit() {
+    // Setting the window before the handshake and after it must reach the
+    // same nonstop cadence: the setter recomputes the negotiated pacing
+    // instead of silently no-opping once ZRINIT has been processed.
+    assert_eq!(count_zcrcw_waits(Some(usize::MAX), None, 32 * 1024), 1);
+    assert_eq!(count_zcrcw_waits(None, Some(usize::MAX), 32 * 1024), 1);
+}
+
+/// Drives a live [`Sender`] and [`Receiver`] against each other over
+/// in-memory wire queues and returns the bytes the receiver persisted.
+///
+/// Panics if the transfer fails to complete within a generous step
+/// budget, so a protocol deadlock (for instance a dropped ZEOF) surfaces
+/// as a test failure rather than an infinite loop.
+fn run_full_transfer(contents: &[u8]) -> Vec<u8> {
+    let mut sender = Sender::new().unwrap();
+    let mut receiver = Receiver::new().unwrap();
+    sender
+        .start_file(FileInfo::new(
+            b"payload.bin",
+            Some(Position::new(u32::try_from(contents.len()).unwrap())),
+        ))
+        .unwrap();
+    // Single-file transfer: request the closing ZFIN handshake now. The
+    // flag is honored once this file's ZEOF is acknowledged.
+    sender.finish().unwrap();
+
+    let mut downstream: Vec<u8> = Vec::new();
+    let mut upstream: Vec<u8> = Vec::new();
+    let mut received: Vec<u8> = Vec::new();
+    let mut file_done = false;
+    let mut session_done = false;
+
+    for _ in 0..100_000 {
+        let mut progressed = false;
+
+        match sender.poll() {
+            Action::WriteWire(bytes) => {
+                let n = bytes.len();
+                downstream.extend_from_slice(bytes);
+                sender.wire_written(n);
+                progressed = true;
+            }
+            Action::ReadFile { offset, max_len } => {
+                let start = offset.get() as usize;
+                let end = (start + max_len).min(contents.len());
+                sender.submit_file(&contents[start..end]).unwrap();
+                progressed = true;
+            }
+            Action::Event(Event::SessionCompleted) => {
+                session_done = true;
+                progressed = true;
+            }
+            Action::Event(_) => progressed = true,
+            Action::Idle => {
+                if !upstream.is_empty() {
+                    let consumed = sender.submit_wire(&upstream).unwrap();
+                    upstream.drain(..consumed);
+                    progressed = true;
+                }
+            }
+            other => panic!("unexpected sender action: {other:?}"),
+        }
+
+        match receiver.poll() {
+            Action::WriteWire(bytes) => {
+                let n = bytes.len();
+                upstream.extend_from_slice(bytes);
+                receiver.wire_written(n);
+                progressed = true;
+            }
+            Action::WriteFile(bytes) => {
+                received.extend_from_slice(bytes);
+                let n = bytes.len();
+                receiver.file_written(n).unwrap();
+                progressed = true;
+            }
+            Action::Event(Event::FileCompleted) => {
+                file_done = true;
+                progressed = true;
+            }
+            Action::Event(_) => progressed = true,
+            Action::Idle => {
+                if !downstream.is_empty() {
+                    let consumed = receiver.submit_wire(&downstream).unwrap();
+                    downstream.drain(..consumed);
+                    progressed = true;
+                }
+            }
+            other => panic!("unexpected receiver action: {other:?}"),
+        }
+
+        if session_done && downstream.is_empty() && upstream.is_empty() {
+            break;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    assert!(file_done, "file transfer never completed (deadlock?)");
+    assert!(session_done, "session never completed");
+    received
+}
+
+#[test]
+fn test_empty_file_transfer_completes() {
+    // A zero-length file drives the sender to answer ZRPOS(0) with an
+    // immediate ZEOF(0) and no data frame. The receiver, still in
+    // FileBegin, must accept that completion instead of stalling. This is
+    // zmodem2's own sender deadlocking its own receiver before the fix,
+    // no external peer required.
+    assert_eq!(run_full_transfer(b""), b"");
+}
+
+#[test]
+fn test_nonempty_file_transfer_roundtrips() {
+    // Guards the empty-file fix against regressing the ordinary path: a
+    // multi-subpacket file must still arrive byte-for-byte.
+    let contents: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(run_full_transfer(&contents), contents);
+}
+
+#[test]
+fn test_manual_accept_at_eof_completes() {
+    // The maintainer's example: accepting a file at an offset that already
+    // sits at EOF (the whole file is present locally) leaves the receiver
+    // in FileBegin, and the sender replies with ZEOF and no data frame.
+    let mut receiver = Receiver::new().unwrap();
+    receiver.set_manual_file_accept(true);
+    // feed_receiver_zfile announces a 123-byte file.
+    feed_receiver_zfile(&mut receiver);
+
+    receiver.accept_file_at(123).unwrap();
+    // Drain the ZRPOS(123) the acceptance queued.
+    drain_wire_receiver(&mut receiver);
+
+    let zeof = write_header(Header::new(
+        Encoding::ZBIN32,
+        Frame::ZEOF,
+        123u32.to_le_bytes(),
+    ));
+    assert!(receiver.submit_wire(&zeof).unwrap() > 0);
+    assert_eq!(receiver.poll(), Action::Event(Event::FileCompleted));
 }

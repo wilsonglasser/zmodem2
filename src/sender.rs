@@ -22,6 +22,10 @@ use crate::wire::{
 use core::cmp::min;
 
 /// ZMODEM sender state machine.
+// The sender carries a handful of independent flags (has-file,
+// frame-needs-header, finish-requested, receiver-nonstop) that read more
+// clearly as bools than as a single packed enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Sender {
     state: SenderPhase,
     file_name: String,
@@ -39,6 +43,7 @@ pub struct Sender {
     pending_event: Option<SenderEvent>,
     finish_requested: bool,
     streaming_window: usize,
+    rx_nonstop: bool,
 }
 
 impl Sender {
@@ -65,6 +70,7 @@ impl Sender {
             pending_event: None,
             finish_requested: false,
             streaming_window: SUBPACKET_PER_ACK,
+            rx_nonstop: false,
         };
         sender.queue_zrqinit()?;
         Ok(sender)
@@ -82,6 +88,14 @@ impl Sender {
     /// advertised a bounded buffer, whose pacing is honored as before.
     pub fn set_streaming_window(&mut self, subpackets: usize) {
         self.streaming_window = subpackets.max(1);
+        // ZRINIT may already have been negotiated, in which case
+        // max_subpackets_per_ack was fixed from the previous window.
+        // Recompute it now so a window set after the handshake still
+        // takes effect; it only applies when the receiver advertised
+        // nonstop I/O (see update_receiver_caps).
+        if self.rx_nonstop {
+            self.max_subpackets_per_ack = self.streaming_window;
+        }
     }
 
     /// Starts sending a file with the provided metadata.
@@ -451,6 +465,10 @@ impl Sender {
         let rx_buf_size = u16::from_le_bytes([flags[0], flags[1]]) as usize;
         let caps = flags[3];
         let can_ovio = (caps & Zrinit::CANOVIO.bits()) != 0;
+
+        // Remember whether the streaming window governs pacing so a later
+        // set_streaming_window() can recompute the cadence.
+        self.rx_nonstop = rx_buf_size == 0 && can_ovio;
 
         if rx_buf_size == 0 {
             self.max_subpacket_size = SUBPACKET_MAX_SIZE;

@@ -22,6 +22,10 @@ use core::cmp::min;
 const RECEIVER_EVENT_QUEUE_CAP: usize = 4;
 
 /// ZMODEM receiver state machine.
+// The receiver tracks several independent one-shot conditions (escape
+// continuation, overlapped I/O, manual accept, active file) that don't
+// collapse into a single enum without losing clarity.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Receiver {
     state: ReceiverPhase,
     count: u32,
@@ -42,6 +46,7 @@ pub struct Receiver {
     buffer_len: u16,
     overlapped_io: bool,
     manual_accept: bool,
+    file_active: bool,
 }
 
 impl Receiver {
@@ -105,6 +110,7 @@ impl Receiver {
             buffer_len,
             overlapped_io,
             manual_accept: false,
+            file_active: false,
         };
         receiver.queue_zrinit()?;
         Ok(receiver)
@@ -144,6 +150,11 @@ impl Receiver {
         self.queue_zrpos(offset)?;
         self.count = offset;
         self.state = ReceiverPhase::FileBegin;
+        // The sender's response may be ZDATA (more bytes) or, when the
+        // resume offset already sits at EOF, an immediate ZEOF with no
+        // data frame. Mark the file active so the ZEOF handler accepts
+        // that completion in FileBegin (see handle_header).
+        self.file_active = true;
         Ok(())
     }
 
@@ -161,6 +172,7 @@ impl Receiver {
         }
         self.queue_header(Header::new(Encoding::ZHEX, Frame::ZSKIP, [0; 4]))?;
         self.state = ReceiverPhase::FileBegin;
+        self.file_active = false;
         Ok(())
     }
 
@@ -469,11 +481,20 @@ impl Receiver {
                 self.buf_write_offset = 0;
             }
             Frame::ZEOF
-                if self.state == ReceiverPhase::FileWaitingSubpacket
+                if (self.state == ReceiverPhase::FileWaitingSubpacket
+                    || (self.state == ReceiverPhase::FileBegin && self.file_active))
                     && header.count() == self.count =>
             {
+                // FileBegin is reached both while a file is active (right
+                // after accept_file_at / auto-accept, before any ZDATA,
+                // where a resume at EOF or an empty file yields an
+                // immediate ZEOF) and between files (after a prior
+                // completion). The file_active guard keeps a stray or
+                // resent ZEOF in the between-files state from emitting a
+                // second FileComplete.
                 self.queue_zrinit()?;
                 self.state = ReceiverPhase::FileBegin;
+                self.file_active = false;
                 self.push_event(ReceiverEvent::FileComplete)?;
             }
             Frame::ZABORT | Frame::ZCAN => {
@@ -617,6 +638,11 @@ impl Receiver {
                     } else {
                         self.queue_zrpos(0)?;
                         self.state = ReceiverPhase::FileBegin;
+                        // Same as accept_file_at: an empty file makes the
+                        // sender answer ZRPOS(0) with an immediate ZEOF(0)
+                        // and no data frame, which must complete from
+                        // FileBegin.
+                        self.file_active = true;
                     }
                     self.subpacket_state = SubpacketPhase::Idle;
                     self.push_event(ReceiverEvent::FileStart)?;
