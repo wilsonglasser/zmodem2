@@ -7,6 +7,7 @@
 
 use crate::buffer::Buffer;
 use crate::header::{Encoding, Frame, Header, Zrinit};
+use crate::receiver::MAX_ZRPOS_RETRIES;
 use crate::wire::{BufferWriter, HeaderReader, SliceReader, SubpacketType};
 use crate::{Action, Error, Event, FileInfo, Position, Receiver, Sender, ZDLE, ZPAD};
 use rstest::rstest;
@@ -552,6 +553,36 @@ fn test_repeated_corruption_eventually_fails() {
         }
     }
     assert_eq!(result, Err(Error::UnexpectedCrc32));
+}
+
+#[test]
+fn test_recovery_budget_replenishes_on_progress() {
+    let mut receiver = Receiver::new().unwrap();
+    feed_receiver_zfile(&mut receiver);
+
+    // Line noise on a long transfer: errors are spread out, and every
+    // retransmission after a rewind arrives clean. Far more corrupt
+    // subpackets than the retry ceiling must still recover, because the
+    // budget counts a consecutive streak, not a lifetime total. A link
+    // that merely accumulates occasional errors would otherwise fail
+    // once, arbitrarily, after enough good data had gone through.
+    let mut offset = 0u32;
+    for _ in 0..(u32::from(MAX_ZRPOS_RETRIES) * 3) {
+        let count = feed_corrupt_subpacket(&mut receiver, offset).unwrap();
+        assert_eq!(
+            count, offset,
+            "receiver should rewind to the last good offset"
+        );
+
+        let mut good = write_header(Header::new(
+            Encoding::ZBIN32,
+            Frame::ZDATA,
+            offset.to_le_bytes(),
+        ));
+        good.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"clean"));
+        consume_file_chunk(&mut receiver, &good, b"clean");
+        offset += 5;
+    }
 }
 
 #[test]

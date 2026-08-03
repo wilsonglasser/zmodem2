@@ -56,7 +56,7 @@ pub struct Receiver {
 /// this many attempts is failing, so surfacing the CRC error is more
 /// honest than looping forever. lrzsz's `rz` gives up on a similar
 /// garbage/retry threshold.
-const MAX_ZRPOS_RETRIES: u8 = 10;
+pub(crate) const MAX_ZRPOS_RETRIES: u8 = 10;
 
 impl Receiver {
     /// Create a new receiver instance.
