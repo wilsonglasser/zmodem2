@@ -69,6 +69,7 @@ pub(crate) struct HeaderReader {
     encoding: Option<Encoding>,
     expected_len: usize,
     escape_pending: bool,
+    resyncing: bool,
 }
 
 impl HeaderReader {
@@ -80,9 +81,22 @@ impl HeaderReader {
             encoding: None,
             expected_len: 0,
             escape_pending: false,
+            resyncing: false,
         }
     }
 
+    /// Enter resynchronisation mode: malformed framing is treated as
+    /// garbage to skip past rather than a fatal error, until the next
+    /// well-formed header is decoded. The receiver arms this after a
+    /// corrupt data subpacket, when the sender is still transmitting the
+    /// tail of the aborted window (arbitrary bytes, some of which look
+    /// like a header start) before it honours the ZRPOS and rewinds.
+    pub(crate) fn enter_resync(&mut self) {
+        self.resyncing = true;
+    }
+
+    /// Resets the framing scan without leaving resync mode (so a garbage
+    /// byte that faked a header start does not clear the tolerance).
     fn reset(&mut self) {
         self.state = HeaderReadState::SeekingZpad;
         self.zpad_state = ZpadState::Idle;
@@ -136,6 +150,12 @@ impl HeaderReader {
                         Ok(encoding) => encoding,
                         Err(e) => {
                             self.reset();
+                            // A `ZPAD ZDLE` in mid-window garbage is not
+                            // a real header: keep scanning instead of
+                            // aborting the transfer.
+                            if self.resyncing {
+                                continue;
+                            }
                             return Err(e);
                         }
                     };
@@ -157,6 +177,9 @@ impl HeaderReader {
 
                     let Some(encoding) = self.encoding else {
                         self.reset();
+                        if self.resyncing {
+                            continue;
+                        }
                         return Err(Error::MalformedHeader);
                     };
 
@@ -164,9 +187,19 @@ impl HeaderReader {
                         Ok(header) => header,
                         Err(e) => {
                             self.reset();
+                            // Garbage that passed the encoding byte by
+                            // chance still fails the header CRC; during
+                            // resync that is one more byte to skip, not a
+                            // fatal error.
+                            if self.resyncing {
+                                continue;
+                            }
                             return Err(e);
                         }
                     };
+                    // A well-formed header ends the resync: the stream is
+                    // realigned, fatal-on-garbage semantics resume.
+                    self.resyncing = false;
                     self.reset();
                     return Ok(Some(header));
                 }

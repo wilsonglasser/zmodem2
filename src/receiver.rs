@@ -46,8 +46,17 @@ pub struct Receiver {
     buffer_len: u16,
     overlapped_io: bool,
     manual_accept: bool,
+    zrpos_retries: u8,
     file_active: bool,
 }
+
+/// Consecutive corrupt data subpackets, without any forward progress in
+/// between, tolerated before the transfer is abandoned. Each one costs a
+/// ZRPOS rewind; a link that cannot deliver a single clean subpacket in
+/// this many attempts is failing, so surfacing the CRC error is more
+/// honest than looping forever. lrzsz's `rz` gives up on a similar
+/// garbage/retry threshold.
+pub(crate) const MAX_ZRPOS_RETRIES: u8 = 10;
 
 impl Receiver {
     /// Create a new receiver instance.
@@ -110,6 +119,7 @@ impl Receiver {
             buffer_len,
             overlapped_io,
             manual_accept: false,
+            zrpos_retries: 0,
             file_active: false,
         };
         receiver.queue_zrinit()?;
@@ -620,8 +630,21 @@ impl Receiver {
             }
             SubpacketPhase::Reading => self.receive_subpacket_data_byte(port),
             SubpacketPhase::Crc(packet) => {
-                if self.crc.process(port, self.data_encoding)?.is_none() {
-                    return Ok(None);
+                match self.crc.process(port, self.data_encoding) {
+                    Ok(Some(())) => {}
+                    Ok(None) => return Ok(None),
+                    // A corrupt DATA subpacket is recoverable: ZMODEM's
+                    // whole reason for existing over X/YMODEM is that the
+                    // receiver asks the sender to retransmit from the last
+                    // good offset instead of aborting. Metadata (ZFILE)
+                    // and ZSINIT CRC failures stay fatal: there is no
+                    // meaningful offset to rewind a header to.
+                    Err(e @ (Error::UnexpectedCrc16 | Error::UnexpectedCrc32))
+                        if self.state == ReceiverPhase::FileReadingSubpacket =>
+                    {
+                        return self.recover_corrupt_subpacket(e);
+                    }
+                    Err(e) => return Err(e),
                 }
 
                 if self.state == ReceiverPhase::FileReadingMetadata {
@@ -674,10 +697,18 @@ impl Receiver {
     }
 
     fn finish_subpacket(&mut self, packet: SubpacketType) -> Result<(), Error> {
-        self.count += u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
+        let len = u32::try_from(self.buf.len()).map_err(|_| Error::OutOfMemory)?;
+        // The running offset is a u32 (ZMODEM positions are 32-bit). A
+        // sender that keeps streaming past 4 GiB, whether buggy or
+        // hostile, must not be able to wrap it back to a low offset and
+        // desynchronise the transfer: refuse instead.
+        self.count = self.count.checked_add(len).ok_or(Error::OutOfMemory)?;
         self.buf.clear();
         self.buf_write_offset = 0;
         self.crc.reset();
+        // A clean subpacket landed: the offset advanced, so the corrupt
+        // streak (if any) is broken and the retry budget is replenished.
+        self.zrpos_retries = 0;
 
         match packet {
             SubpacketType::ZCRCW => {
@@ -702,5 +733,33 @@ impl Receiver {
             }
         }
         Ok(())
+    }
+
+    /// Recovers from a corrupt data subpacket by asking the sender to
+    /// rewind. The buffered (bad) bytes are dropped and `count` is left
+    /// at the last acknowledged offset, so nothing corrupt is persisted
+    /// and no data is skipped; a ZRPOS(count) tells the sender to
+    /// retransmit from there. The header reader is put into resync mode
+    /// because a streaming sender keeps emitting the tail of the aborted
+    /// window before it honours the ZRPOS, and that tail must be skipped
+    /// rather than mistaken for framing.
+    ///
+    /// `err` is returned unchanged once the retry budget is spent, so a
+    /// hopelessly noisy link fails with the same CRC error it would have
+    /// before, just after trying to recover.
+    fn recover_corrupt_subpacket(&mut self, err: Error) -> Result<Option<()>, Error> {
+        self.zrpos_retries = self.zrpos_retries.saturating_add(1);
+        if self.zrpos_retries > MAX_ZRPOS_RETRIES {
+            return Err(err);
+        }
+        self.buf.clear();
+        self.buf_write_offset = 0;
+        self.crc.reset();
+        self.subpacket_escape_pending = false;
+        self.queue_zrpos(self.count)?;
+        self.state = ReceiverPhase::FileWaitingSubpacket;
+        self.subpacket_state = SubpacketPhase::Idle;
+        self.header_reader.enter_resync();
+        Ok(Some(()))
     }
 }

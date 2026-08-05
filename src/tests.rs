@@ -7,6 +7,7 @@
 
 use crate::buffer::Buffer;
 use crate::header::{Encoding, Frame, Header, Zrinit};
+use crate::receiver::MAX_ZRPOS_RETRIES;
 use crate::wire::{BufferWriter, HeaderReader, SliceReader, SubpacketType};
 use crate::{Action, Error, Event, FileInfo, Position, Receiver, Sender, ZDLE, ZPAD};
 use rstest::rstest;
@@ -345,7 +346,7 @@ fn test_zsinit_is_acknowledged() {
 /// receiving a CANFC32 ZRINIT): a ZHEX header, its CR LF(high-bit) XON
 /// line trailer, then a BINARY CRC16 subpacket with the empty attn
 /// string. The hex encoding maps to CRC16 data and the trailer must be
-/// skipped; both mistakes surfaced as UnexpectedCrc16 against the real
+/// skipped; both mistakes surfaced as `UnexpectedCrc16` against the real
 /// tool.
 #[test]
 fn test_zsinit_hex_header_from_lrzsz_is_acknowledged() {
@@ -470,40 +471,172 @@ fn test_start_file_rejects_unknown_size() {
     );
 }
 
+/// Feeds one ZDATA frame at `offset` whose data subpacket is corrupted,
+/// plus a run of mid-window garbage, and returns the count carried by the
+/// ZRPOS the receiver queues in response. Propagates the receiver error
+/// when recovery is refused (retry budget spent).
+fn feed_corrupt_subpacket(receiver: &mut Receiver, offset: u32) -> Result<u32, Error> {
+    let mut bytes = write_header(Header::new(
+        Encoding::ZBIN32,
+        Frame::ZDATA,
+        offset.to_le_bytes(),
+    ));
+    // ZCRCG keeps the frame open (streaming), like a fast sender.
+    let mut subpacket = escaped_zbin32_subpacket(SubpacketType::ZCRCG, b"corrupt");
+    subpacket[0] ^= 0x01; // flip a payload byte so the CRC mismatches
+    bytes.extend(subpacket);
+    // The sender is still emitting the tail of the aborted window when
+    // the receiver reacts. This run includes a byte pattern that would
+    // have fatally tripped the old header scanner: `*` (a legal data
+    // byte) then `ZDLE` then a non-encoding escape byte.
+    bytes.extend_from_slice(&[ZPAD, ZDLE, encode_zdle(0x11), b'x', b'y']);
+
+    let mut consumed_total = 0;
+    let mut zrpos = None;
+    loop {
+        match receiver.poll() {
+            Action::WriteWire(b) => {
+                let header = parse_first_header(b);
+                if header.frame() == Frame::ZRPOS {
+                    zrpos = Some(header.count());
+                }
+                let n = b.len();
+                receiver.wire_written(n);
+            }
+            Action::WriteFile(_) => panic!("corrupt data must never be written"),
+            Action::Idle => {
+                if consumed_total >= bytes.len() {
+                    break;
+                }
+                let consumed = receiver.submit_wire(&bytes[consumed_total..])?;
+                assert!(consumed > 0, "receiver made no progress on input");
+                consumed_total += consumed;
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+    Ok(zrpos.expect("a corrupt subpacket must queue a ZRPOS"))
+}
+
 #[test]
-fn test_malformed_subpacket_crc() {
+fn test_corrupt_subpacket_triggers_zrpos_and_recovers() {
     let mut receiver = Receiver::new().unwrap();
     feed_receiver_zfile(&mut receiver);
 
-    let mut bytes = write_header(Header::new(Encoding::ZBIN32, Frame::ZDATA, [0; 4]));
-    let mut subpacket = escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"bad");
-    let last = subpacket.last_mut().unwrap();
-    *last ^= 0x01;
-    bytes.extend(subpacket);
+    // A corrupt subpacket at offset 0 must not abort: the receiver asks
+    // the sender to rewind to the last good offset and skips the garbage
+    // tail without tripping on it.
+    let count = feed_corrupt_subpacket(&mut receiver, 0).unwrap();
+    assert_eq!(count, 0, "receiver should rewind to the last good offset");
+
+    // The sender honours the ZRPOS and retransmits cleanly from 0; the
+    // stream is realigned and the good data flows through.
+    let mut good = write_header(Header::new(Encoding::ZBIN32, Frame::ZDATA, [0; 4]));
+    good.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"clean"));
+    consume_file_chunk(&mut receiver, &good, b"clean");
+}
+
+#[test]
+fn test_repeated_corruption_eventually_fails() {
+    let mut receiver = Receiver::new().unwrap();
+    feed_receiver_zfile(&mut receiver);
+
+    // Every retransmission arrives corrupt at the same offset: no forward
+    // progress, so the retry budget is never replenished and the receiver
+    // must give up rather than ZRPOS-loop forever. The loop bound exceeds
+    // the internal retry ceiling; recovery must fail before it is hit.
+    let mut result = Ok(0);
+    for _ in 0..64 {
+        result = feed_corrupt_subpacket(&mut receiver, 0);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert_eq!(result, Err(Error::UnexpectedCrc32));
+}
+
+#[test]
+fn test_recovery_budget_replenishes_on_progress() {
+    let mut receiver = Receiver::new().unwrap();
+    feed_receiver_zfile(&mut receiver);
+
+    // Line noise on a long transfer: errors are spread out, and every
+    // retransmission after a rewind arrives clean. Far more corrupt
+    // subpackets than the retry ceiling must still recover, because the
+    // budget counts a consecutive streak, not a lifetime total. A link
+    // that merely accumulates occasional errors would otherwise fail
+    // once, arbitrarily, after enough good data had gone through.
+    let mut offset = 0u32;
+    for _ in 0..(u32::from(MAX_ZRPOS_RETRIES) * 3) {
+        let count = feed_corrupt_subpacket(&mut receiver, offset).unwrap();
+        assert_eq!(
+            count, offset,
+            "receiver should rewind to the last good offset"
+        );
+
+        let mut good = write_header(Header::new(
+            Encoding::ZBIN32,
+            Frame::ZDATA,
+            offset.to_le_bytes(),
+        ));
+        good.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"clean"));
+        consume_file_chunk(&mut receiver, &good, b"clean");
+        offset += 5;
+    }
+}
+
+#[test]
+fn test_offset_overflow_is_refused() {
+    let mut receiver = Receiver::new().unwrap();
+    receiver.set_manual_file_accept(true);
+    feed_receiver_zfile(&mut receiver);
+
+    // Resume a few bytes short of the 4 GiB position ceiling, then feed a
+    // subpacket long enough to push the running offset past u32::MAX. The
+    // counter must refuse to wrap (which would rewind the transfer to a
+    // low offset) and surface an error instead.
+    let near = u32::MAX - 4;
+    receiver.accept_file_at(near).unwrap();
+    loop {
+        match receiver.poll() {
+            Action::WriteWire(b) => {
+                let n = b.len();
+                receiver.wire_written(n);
+            }
+            Action::Idle => break,
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    let mut wire = write_header(Header::new(
+        Encoding::ZBIN32,
+        Frame::ZDATA,
+        near.to_le_bytes(),
+    ));
+    wire.extend(escaped_zbin32_subpacket(SubpacketType::ZCRCE, b"overflow!"));
 
     let mut offset = 0;
     let err = loop {
-        match receiver.submit_wire(&bytes[offset..]) {
-            Ok(consumed) => {
-                offset += consumed;
-                if consumed == 0 {
-                    match receiver.poll() {
-                        Action::WriteWire(b) => {
-                            let n = b.len();
-                            receiver.wire_written(n);
-                        }
-                        Action::WriteFile(b) => {
-                            let n = b.len();
-                            receiver.file_written(n).unwrap();
-                        }
-                        other => panic!("no progress: {other:?}"),
-                    }
+        match receiver.poll() {
+            Action::WriteWire(b) => {
+                let n = b.len();
+                receiver.wire_written(n);
+            }
+            Action::WriteFile(b) => {
+                let n = b.len();
+                if let Err(e) = receiver.file_written(n) {
+                    break e;
                 }
             }
-            Err(error) => break error,
+            Action::Idle => {
+                assert!(offset < wire.len(), "ran out of input before overflow");
+                let consumed = receiver.submit_wire(&wire[offset..]).unwrap();
+                offset += consumed;
+            }
+            other => panic!("unexpected action: {other:?}"),
         }
     };
-    assert_eq!(err, Error::UnexpectedCrc32);
+    assert_eq!(err, Error::OutOfMemory);
 }
 
 #[test]
