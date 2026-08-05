@@ -845,7 +845,7 @@ fn run_full_transfer(contents: &[u8]) -> Vec<u8> {
 
     let mut downstream: Vec<u8> = Vec::new();
     let mut upstream: Vec<u8> = Vec::new();
-    let mut received: Vec<u8> = Vec::new();
+    let mut persisted: Vec<u8> = Vec::new();
     let mut file_done = false;
     let mut session_done = false;
 
@@ -888,7 +888,7 @@ fn run_full_transfer(contents: &[u8]) -> Vec<u8> {
                 progressed = true;
             }
             Action::WriteFile(bytes) => {
-                received.extend_from_slice(bytes);
+                persisted.extend_from_slice(bytes);
                 let n = bytes.len();
                 receiver.file_written(n).unwrap();
                 progressed = true;
@@ -918,7 +918,7 @@ fn run_full_transfer(contents: &[u8]) -> Vec<u8> {
 
     assert!(file_done, "file transfer never completed (deadlock?)");
     assert!(session_done, "session never completed");
-    received
+    persisted
 }
 
 #[test]
