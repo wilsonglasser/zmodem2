@@ -8,7 +8,7 @@ use crate::buffer::Buffer;
 use crate::crc;
 use crate::error::Error;
 use crate::header::{
-    write_slice_escaped, Encoding, Frame, Header, Zrinit, HEADER_PAYLOAD_SIZE, HEADER_SIZE,
+    Encoding, Frame, HEADER_PAYLOAD_SIZE, HEADER_SIZE, Header, Zrinit, write_slice_escaped,
 };
 use crate::io::{Read, Write};
 use crate::zdle;

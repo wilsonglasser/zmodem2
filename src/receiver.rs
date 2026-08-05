@@ -13,10 +13,10 @@ use crate::io::Read;
 use crate::session::{ReceiverEvent, ReceiverPhase, SubpacketPhase};
 use crate::string::String;
 use crate::wire::{
-    write_zrinit, BufferWriter, HeaderReader, RxCrc, SliceReader, SubpacketType,
-    SUBPACKET_MAX_SIZE, WIRE_BUF_SIZE,
+    BufferWriter, HeaderReader, RxCrc, SUBPACKET_MAX_SIZE, SliceReader, SubpacketType,
+    WIRE_BUF_SIZE, write_zrinit,
 };
-use crate::{zdle, ZDLE};
+use crate::{ZDLE, zdle};
 use core::cmp::min;
 
 const RECEIVER_EVENT_QUEUE_CAP: usize = 4;
@@ -571,7 +571,11 @@ impl Receiver {
     }
 
     /// Handles a plain (non-escape-continuation) subpacket byte.
-    fn receive_subpacket_plain_byte<P>(&mut self, port: &mut P, byte: u8) -> Result<Option<()>, Error>
+    fn receive_subpacket_plain_byte<P>(
+        &mut self,
+        port: &mut P,
+        byte: u8,
+    ) -> Result<Option<()>, Error>
     where
         P: Read + ?Sized,
     {

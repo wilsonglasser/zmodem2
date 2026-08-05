@@ -9,15 +9,15 @@ use crate::buffer::Buffer;
 use crate::error::Error;
 use crate::file::write_zfile;
 use crate::header::{
-    Encoding, Frame, Header, Zrinit, ZDATA_HEADER, ZEOF_HEADER, ZFIN_HEADER, ZNAK_HEADER,
-    ZRQINIT_HEADER,
+    Encoding, Frame, Header, ZDATA_HEADER, ZEOF_HEADER, ZFIN_HEADER, ZNAK_HEADER, ZRQINIT_HEADER,
+    Zrinit,
 };
 use crate::io::Write;
 use crate::session::{FileRequest, SenderEvent, SenderPhase};
 use crate::string::String;
 use crate::wire::{
-    write_subpacket, BufferWriter, HeaderReader, SliceReader, SubpacketType, SUBPACKET_MAX_SIZE,
-    SUBPACKET_PER_ACK, WIRE_BUF_SIZE,
+    BufferWriter, HeaderReader, SUBPACKET_MAX_SIZE, SUBPACKET_PER_ACK, SliceReader, SubpacketType,
+    WIRE_BUF_SIZE, write_subpacket,
 };
 use core::cmp::min;
 

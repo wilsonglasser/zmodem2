@@ -8,7 +8,7 @@ use crate::buffer::Buffer;
 use crate::error::Error;
 use crate::header::{Encoding, Frame, Header};
 use crate::io::Write;
-use crate::wire::{write_subpacket, SubpacketType, SUBPACKET_MAX_SIZE};
+use crate::wire::{SUBPACKET_MAX_SIZE, SubpacketType, write_subpacket};
 use core::fmt::Write as _;
 
 /// Parses a u32 from a slice of ASCII decimal bytes.
